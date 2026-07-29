@@ -2,3 +2,4 @@ discord.py
 rich
 dotenv
 watchdog
+tzdata

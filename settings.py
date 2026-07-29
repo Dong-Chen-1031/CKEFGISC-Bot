@@ -27,3 +27,23 @@ if DISCORD_BOT_TOKEN is None:
 
 # 機器人開發者指令前綴
 PREFIX = ".dev "
+
+# ── 倒數頻道設定 ──
+
+# 計算倒數用的時區
+TIMEZONE = "Asia/Taipei"
+
+# 倒數設定的儲存位置
+COUNTDOWN_DATA_FILE = "data/countdowns.json"
+
+# 每幾分鐘檢查一次倒數頻道名稱
+# Discord 限制每個頻道 10 分鐘只能改名 2 次，不建議調得比 5 更低
+COUNTDOWN_UPDATE_INTERVAL = 10
+
+# ── 群發通知設定 ──
+
+# 群發紀錄的儲存位置
+NOTIFY_DATA_FILE = "data/notifications.json"
+
+# 每封私訊之間間隔幾秒，太短會被 Discord 限流
+NOTIFY_SEND_DELAY = 1.0
