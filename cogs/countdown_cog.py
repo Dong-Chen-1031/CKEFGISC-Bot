@@ -35,16 +35,12 @@ class CountdownCog(commands.Cog):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.countdowns: dict[int, cd.Countdown] = cd.load_all()
 
     async def cog_load(self):
         self.update_loop.start()
 
     async def cog_unload(self):
         self.update_loop.cancel()
-
-    def save(self):
-        cd.save_all(self.countdowns)
 
     # ------------------------------------------------------------ 核心動作
 
@@ -88,7 +84,7 @@ class CountdownCog(commands.Cog):
     @tasks.loop(minutes=settings.COUNTDOWN_UPDATE_INTERVAL)
     async def update_loop(self):
         updated = 0
-        for entry in list(self.countdowns.values()):
+        for entry in cd.all_countdowns():
             if await self.apply(entry):
                 updated += 1
         if updated:
@@ -101,8 +97,7 @@ class CountdownCog(commands.Cog):
     @commands.Cog.listener()
     async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel):
         """頻道被刪掉就順手清掉設定"""
-        if self.countdowns.pop(channel.id, None) is not None:
-            self.save()
+        if cd.delete_countdown(channel.id):
             logging.info(f"倒數頻道 {channel.id} 已被刪除，設定一併移除")
 
     # ------------------------------------------------------------ 指令
@@ -159,8 +154,7 @@ class CountdownCog(commands.Cog):
             return
 
         entry.channel_id = channel.id
-        self.countdowns[channel.id] = entry
-        self.save()
+        cd.save_countdown(entry)
 
         await interaction.followup.send(embed=preview_embed(entry, "✅ 倒數頻道已建立"))
 
@@ -201,8 +195,7 @@ class CountdownCog(commands.Cog):
             target=target.isoformat(),
             template=template,
         )
-        self.countdowns[channel.id] = entry
-        self.save()
+        cd.save_countdown(entry)
 
         try:
             await self.set_lock(channel, lock)
@@ -237,7 +230,7 @@ class CountdownCog(commands.Cog):
         log(interaction, channel=channel.name)
         await interaction.response.defer(ephemeral=True)
 
-        entry = self.countdowns.get(channel.id)
+        entry = cd.get_countdown(channel.id)
         if entry is None:
             await interaction.followup.send(
                 embed=ui.info_embed(f"{channel.mention} 還沒有設定倒數", discord.Color.red())
@@ -265,7 +258,7 @@ class CountdownCog(commands.Cog):
 
         if name:
             entry.name = name
-        self.save()
+        entry = cd.save_countdown(entry)
 
         await self.apply(entry)
         await interaction.followup.send(embed=preview_embed(entry, "✅ 倒數已更新"))
@@ -273,7 +266,7 @@ class CountdownCog(commands.Cog):
     @countdown.command(name="list", description="列出這個伺服器所有的倒數")
     async def list_countdowns(self, interaction: Interaction):
         log(interaction)
-        entries = [c for c in self.countdowns.values() if c.guild_id == interaction.guild_id]
+        entries = cd.guild_countdowns(interaction.guild_id)
         if not entries:
             await interaction.response.send_message(
                 embed=ui.info_embed("這個伺服器還沒有任何倒數"), ephemeral=True
@@ -307,12 +300,11 @@ class CountdownCog(commands.Cog):
         log(interaction, channel=channel.name, delete_channel=delete_channel)
         await interaction.response.defer(ephemeral=True)
 
-        if self.countdowns.pop(channel.id, None) is None:
+        if not cd.delete_countdown(channel.id):
             await interaction.followup.send(
                 embed=ui.info_embed(f"{channel.mention} 沒有設定倒數", discord.Color.red())
             )
             return
-        self.save()
 
         if delete_channel:
             try:
@@ -334,7 +326,7 @@ class CountdownCog(commands.Cog):
         log(interaction)
         await interaction.response.defer(ephemeral=True)
 
-        entries = [c for c in self.countdowns.values() if c.guild_id == interaction.guild_id]
+        entries = cd.guild_countdowns(interaction.guild_id)
         updated = 0
         for entry in entries:
             if await self.apply(entry):

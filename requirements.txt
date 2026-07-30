@@ -3,3 +3,4 @@ rich
 dotenv
 watchdog
 tzdata
+sqlmodel

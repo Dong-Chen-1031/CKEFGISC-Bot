@@ -33,17 +33,21 @@ PREFIX = ".dev "
 # 計算倒數用的時區
 TIMEZONE = "Asia/Taipei"
 
-# 倒數設定的儲存位置
-COUNTDOWN_DATA_FILE = "data/countdowns.json"
-
 # 每幾分鐘檢查一次倒數頻道名稱
 # Discord 限制每個頻道 10 分鐘只能改名 2 次，不建議調得比 5 更低
 COUNTDOWN_UPDATE_INTERVAL = 10
 
-# ── 群發通知設定 ──
+# ── 資料庫 ──
 
-# 群發紀錄的儲存位置
+# SQLite 資料庫位置
+DATABASE_FILE = "data/bot.db"
+
+# 舊版 JSON 的位置。資料庫是空的、而這些檔案還在的話，
+# 開機時會自動把資料搬進資料庫（只會搬一次）。
+COUNTDOWN_DATA_FILE = "data/countdowns.json"
 NOTIFY_DATA_FILE = "data/notifications.json"
+
+# ── 群發通知設定 ──
 
 # 每封私訊之間間隔幾秒，太短會被 Discord 限流
 NOTIFY_SEND_DELAY = 1.0

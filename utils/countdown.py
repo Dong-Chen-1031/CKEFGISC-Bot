@@ -1,19 +1,14 @@
-"""日期倒數的資料模型與儲存
+"""日期倒數的資料表與查詢
 
-倒數資料以 JSON 存在 `settings.COUNTDOWN_DATA_FILE`，以頻道 ID 為 key，
-所以一個語音頻道同時只會有一個倒數。
+一個語音頻道同時只會有一個倒數，所以 channel_id 直接當主鍵。
 """
 
 import datetime
-import json
-import logging
-import os
-from dataclasses import dataclass, asdict, field
-from zoneinfo import ZoneInfo
 
-import settings
+from sqlmodel import Field, SQLModel, select
 
-TZ = ZoneInfo(settings.TIMEZONE)
+# 時區與日期解析放在共用模組，這裡 re-export 讓 cd.parse_target 等用法照舊
+from utils.timeparse import TZ, now, parse_target, to_dt  # noqa: F401
 
 DEFAULT_TEMPLATE = "{name} 剩 {days} 天"
 DEFAULT_EXPIRED_TEMPLATE = "{name} 時間到"
@@ -36,9 +31,6 @@ PLACEHOLDERS = {
     "{target_time}": "目標時刻 (08:00)",
 }
 
-_DATE_FORMATS = ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%m-%d", "%m/%d", "%m.%d")
-_TIME_FORMATS = ("%H:%M:%S", "%H:%M", "%H")
-
 
 class _SafeDict(dict):
     """找不到的變數就原樣保留，避免使用者打錯字直接炸掉"""
@@ -47,59 +39,11 @@ class _SafeDict(dict):
         return "{" + key + "}"
 
 
-def now() -> datetime.datetime:
-    return datetime.datetime.now(TZ)
+class Countdown(SQLModel, table=True):
+    __tablename__ = "countdown"
 
-
-def parse_target(date_str: str, time_str: str | None = None) -> datetime.datetime:
-    """把使用者輸入的日期(、時間)字串轉成帶時區的 datetime
-
-    接受 2025-01-01、2025/1/1、1/1 (視為今年)；時間可寫在 date_str 裡或分開給。
-    """
-    date_str = date_str.strip()
-
-    # 允許把時間直接打在日期欄位，例如 "2025-01-01 08:00"
-    if " " in date_str:
-        date_str, _, rest = date_str.partition(" ")
-        rest = rest.strip()
-        if rest and not time_str:
-            time_str = rest
-
-    date_part = None
-    for fmt in _DATE_FORMATS:
-        try:
-            parsed = datetime.datetime.strptime(date_str, fmt)
-        except ValueError:
-            continue
-        if "%Y" in fmt:
-            date_part = parsed.date()
-        else:
-            # 沒給年份 → 當作今年
-            date_part = parsed.date().replace(year=now().year)
-        break
-
-    if date_part is None:
-        raise ValueError(f"看不懂的日期格式：`{date_str}`，請用像 `2025-01-01` 或 `1/1` 的寫法")
-
-    time_part = datetime.time(0, 0)
-    if time_str:
-        time_str = time_str.strip()
-        for fmt in _TIME_FORMATS:
-            try:
-                time_part = datetime.datetime.strptime(time_str, fmt).time()
-                break
-            except ValueError:
-                continue
-        else:
-            raise ValueError(f"看不懂的時間格式：`{time_str}`，請用像 `08:00` 的寫法")
-
-    return datetime.datetime.combine(date_part, time_part, tzinfo=TZ)
-
-
-@dataclass
-class Countdown:
-    guild_id: int
-    channel_id: int
+    channel_id: int = Field(primary_key=True)
+    guild_id: int = Field(index=True)
     name: str
     target: str  # ISO 8601 字串
     template: str = DEFAULT_TEMPLATE
@@ -107,10 +51,7 @@ class Countdown:
 
     @property
     def target_dt(self) -> datetime.datetime:
-        dt = datetime.datetime.fromisoformat(self.target)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=TZ)
-        return dt.astimezone(TZ)
+        return to_dt(self.target)
 
     def is_expired(self, at: datetime.datetime | None = None) -> bool:
         return (at or now()) >= self.target_dt
@@ -144,44 +85,59 @@ class Countdown:
 
 def validate_template(template: str) -> None:
     """模板寫壞的話直接丟 ValueError，讓指令能當場回報"""
-    sample = Countdown(0, 0, "測試", now().isoformat())
+    sample = Countdown(
+        channel_id=0, guild_id=0, name="測試", target=now().isoformat()
+    )
     try:
         template.format_map(_SafeDict(sample.fields()))
     except (ValueError, IndexError, KeyError) as e:
         raise ValueError(f"名稱模板格式錯誤：{e}") from e
 
 
-# ---------------------------------------------------------------- 儲存
+# ---------------------------------------------------------------- 查詢
 
 
-def _ensure_dir() -> None:
-    directory = os.path.dirname(settings.COUNTDOWN_DATA_FILE)
-    if directory and not os.path.exists(directory):
-        os.makedirs(directory, exist_ok=True)
+def all_countdowns() -> list[Countdown]:
+    from utils.db import session
+
+    with session() as s:
+        return list(s.exec(select(Countdown)).all())
 
 
-def load_all() -> dict[int, Countdown]:
-    """讀出所有倒數，key 為頻道 ID"""
-    if not os.path.exists(settings.COUNTDOWN_DATA_FILE):
-        return {}
-    try:
-        with open(settings.COUNTDOWN_DATA_FILE, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
-        logging.error(f"倒數資料讀取失敗: {e}")
-        return {}
+def guild_countdowns(guild_id: int) -> list[Countdown]:
+    from utils.db import session
 
-    result = {}
-    for channel_id, data in raw.items():
-        try:
-            result[int(channel_id)] = Countdown(**data)
-        except TypeError as e:
-            logging.warning(f"略過壞掉的倒數資料 {channel_id}: {e}")
-    return result
+    with session() as s:
+        return list(
+            s.exec(select(Countdown).where(Countdown.guild_id == guild_id)).all()
+        )
 
 
-def save_all(countdowns: dict[int, Countdown]) -> None:
-    _ensure_dir()
-    raw = {str(cid): asdict(c) for cid, c in countdowns.items()}
-    with open(settings.COUNTDOWN_DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(raw, f, ensure_ascii=False, indent=2)
+def get_countdown(channel_id: int) -> Countdown | None:
+    from utils.db import session
+
+    with session() as s:
+        return s.get(Countdown, channel_id)
+
+
+def save_countdown(entry: Countdown) -> Countdown:
+    """新增或更新（channel_id 是主鍵，merge 會自動判斷）"""
+    from utils.db import session
+
+    with session() as s:
+        merged = s.merge(entry)
+        s.commit()
+        return merged
+
+
+def delete_countdown(channel_id: int) -> bool:
+    """回傳 True 代表本來有這筆、已經刪掉"""
+    from utils.db import session
+
+    with session() as s:
+        row = s.get(Countdown, channel_id)
+        if row is None:
+            return False
+        s.delete(row)
+        s.commit()
+        return True

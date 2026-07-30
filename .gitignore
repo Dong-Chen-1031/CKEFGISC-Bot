@@ -177,3 +177,9 @@ cython_debug/
 
 # 倒數資料
 data/
+
+# SQLite
+data/
+*.db
+*.db-wal
+*.db-shm

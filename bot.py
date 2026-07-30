@@ -13,6 +13,7 @@ from rich import print
 from discord import Embed
 
 from utils import log
+from utils.db import init_db
 
 intents = discord.Intents.all()
 
@@ -37,6 +38,8 @@ async def load_extensions_all():
             # logging.info(f'已載入模組: {filename[:-3]}')
 
 async def main():
+    # 建表 + 需要時把舊的 JSON 資料搬進資料庫，要在載入 Cogs 之前完成
+    init_db()
     async with bot:
         await load_extensions_all()
         await bot.start(settings.DISCORD_BOT_TOKEN)
