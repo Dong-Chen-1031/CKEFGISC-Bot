@@ -24,12 +24,15 @@ def now() -> datetime.datetime:
 class Broadcast:
     id: int
     guild_id: int
-    role_id: int
     author_id: int
     title: str
     content: str
     created_at: str
+    # 發給整個身分組時記下 role_id；只發給特定幾個人時為 None
+    role_id: int | None = None
     channel_id: int | None = None
+    # True 時收件者看不到發布者是誰（/notify status 仍會留紀錄）
+    anonymous: bool = False
     targets: list[int] = field(default_factory=list)
     # user_id (str, 因為 JSON 的 key 只能是字串) -> 按下已讀的時間
     read: dict[str, str] = field(default_factory=dict)
@@ -42,6 +45,11 @@ class Broadcast:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=TZ)
         return dt.astimezone(TZ)
+
+    @property
+    def is_role_broadcast(self) -> bool:
+        """True 代表發給整個身分組，False 代表只發給指定的幾個人"""
+        return self.role_id is not None
 
     @property
     def delivered(self) -> list[int]:

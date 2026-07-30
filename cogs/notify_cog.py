@@ -37,12 +37,20 @@ def build_embed(
 
     # footer 不會渲染提及，所以發布者只能用顯示名稱，改放頭像當圖示
     status = f"✅ 你已於 {read_at:%Y-%m-%d %H:%M} 確認已讀" if read_at else READ_HINT
-    signature = f"發布者:{author.display_name if author else '未知'}"
-    if guild:
-        signature += f"｜{guild.name}"
+
+    if bc.anonymous:
+        # 匿名時連頭像也要換掉，否則等於直接指出是誰發的
+        signature = guild.name if guild else ""
+        icon_url = guild.icon.url if guild and guild.icon else None
+    else:
+        signature = f"發布者:{author.display_name if author else '未知'}"
+        if guild:
+            signature += f"｜{guild.name}"
+        icon_url = author.display_avatar.url if author else None
+
     embed.set_footer(
-        text=f"{status}｜{signature}"[:2048],
-        icon_url=author.display_avatar.url if author else None,
+        text=f"{status}｜{signature}"[:2048] if signature else status[:2048],
+        icon_url=icon_url,
     )
     return embed
 
@@ -118,22 +126,77 @@ class BroadcastModal(discord.ui.Modal, title="群發通知"):
     def __init__(
         self,
         cog: "NotifyCog",
-        role: discord.Role,
-        channel: discord.abc.GuildChannel | None,
+        *,
+        role: discord.Role | None = None,
+        members: list[discord.Member] | None = None,
+        channel: discord.abc.GuildChannel | None = None,
+        anonymous: bool = False,
     ):
         super().__init__()
         self.cog = cog
         self.role = role
+        self.members = members
         self.channel = channel
+        self.anonymous = anonymous
 
     async def on_submit(self, interaction: Interaction):
         await self.cog.start_broadcast(
             interaction,
             role=self.role,
+            members=self.members,
             channel=self.channel,
+            anonymous=self.anonymous,
             title=str(self.notice_title),
             content=str(self.notice_content),
         )
+
+
+class MemberSelect(discord.ui.UserSelect):
+    """挑人用的選單，選完直接接著跳出填寫視窗"""
+
+    def __init__(
+        self,
+        cog: "NotifyCog",
+        channel: discord.abc.GuildChannel | None,
+        anonymous: bool = False,
+    ):
+        super().__init__(
+            placeholder="選擇要通知的成員（可多選，最多 25 人）",
+            min_values=1,
+            max_values=25,
+        )
+        self.cog = cog
+        self.channel = channel
+        self.anonymous = anonymous
+
+    async def callback(self, interaction: Interaction):
+        members = [u for u in self.values if not u.bot]
+        if not members:
+            await interaction.response.send_message(
+                embed=ui.info_embed("選到的都是機器人，請重新選擇", discord.Color.red()),
+                ephemeral=True,
+            )
+            return
+        log(interaction, selected=len(members))
+        await interaction.response.send_modal(
+            BroadcastModal(
+                self.cog,
+                members=members,
+                channel=self.channel,
+                anonymous=self.anonymous,
+            )
+        )
+
+
+class MemberSelectView(discord.ui.View):
+    def __init__(
+        self,
+        cog: "NotifyCog",
+        channel: discord.abc.GuildChannel | None,
+        anonymous: bool = False,
+    ):
+        super().__init__(timeout=180)
+        self.add_item(MemberSelect(cog, channel, anonymous))
 
 
 def mention_list(user_ids: list[int], limit: int = 20) -> str:
@@ -144,6 +207,13 @@ def mention_list(user_ids: list[int], limit: int = 20) -> str:
     if len(user_ids) > limit:
         shown += f" …等 {len(user_ids)} 人"
     return shown[:1024]
+
+
+def target_text(bc: nt.Broadcast) -> str:
+    """群發對象的顯示文字 — 身分組模式顯示提及，個人模式顯示人數"""
+    if bc.is_role_broadcast:
+        return f"<@&{bc.role_id}>（{len(bc.targets)} 人）"
+    return f"指定成員 {len(bc.targets)} 人"
 
 
 class NotifyCog(commands.Cog):
@@ -214,35 +284,61 @@ class NotifyCog(commands.Cog):
         self,
         interaction: Interaction,
         *,
-        role: discord.Role,
+        role: discord.Role | None = None,
+        members: list[discord.Member] | None = None,
         channel: discord.abc.GuildChannel | None,
+        anonymous: bool = False,
         title: str,
         content: str,
     ):
+        """role 和 members 二選一：給 role 就發給整組，給 members 就只發給那些人"""
         await interaction.response.defer(ephemeral=True)
 
-        # role.members 需要完整的成員快取
-        if not interaction.guild.chunked:
-            await interaction.guild.chunk()
+        if role is not None:
+            # role.members 需要完整的成員快取
+            if not interaction.guild.chunked:
+                await interaction.guild.chunk()
 
-        members = [m for m in role.members if not m.bot]
+        # 用 id 當 key 去重 — 有人既在身分組裡、又被單獨指定時只會收到一封
+        resolved: dict[int, discord.Member] = {}
+        role_ids: set[int] = set()
+        if role is not None:
+            for m in role.members:
+                if not m.bot:
+                    resolved[m.id] = m
+                    role_ids.add(m.id)
+        for m in members or []:
+            if not m.bot:
+                resolved[m.id] = m
+
+        members = list(resolved.values())
         if not members:
             await interaction.followup.send(
                 embed=ui.info_embed(
-                    f"{role.mention} 裡沒有可私訊的成員", discord.Color.red()
+                    f"{role.mention} 裡沒有可私訊的成員"
+                    if role is not None
+                    else "沒有可私訊的成員",
+                    discord.Color.red(),
                 )
             )
             return
 
+        extra = len(resolved) - len(role_ids)
+        if role is not None:
+            target_desc = role.mention + (f" + {extra} 位指定成員" if extra else "")
+        else:
+            target_desc = f"{len(members)} 位指定成員"
+
         bc = nt.Broadcast(
             id=nt.next_id(self.broadcasts),
             guild_id=interaction.guild_id,
-            role_id=role.id,
+            role_id=role.id if role is not None else None,
             author_id=interaction.user.id,
             title=title,
             content=content,
             created_at=nt.now().isoformat(),
             channel_id=channel.id if channel else None,
+            anonymous=anonymous,
             targets=[m.id for m in members],
         )
         self.broadcasts[bc.id] = bc
@@ -251,7 +347,7 @@ class NotifyCog(commands.Cog):
         estimate = int(len(members) * settings.NOTIFY_SEND_DELAY)
         await interaction.followup.send(
             embed=ui.info_embed(
-                f"📨 開始群發給 {role.mention} 的 {len(members)} 位成員…\n"
+                f"📨 開始群發給 {target_desc}（共 {len(members)} 人）…\n"
                 f"預計需要約 {estimate} 秒，完成後會回報結果"
             )
         )
@@ -265,7 +361,11 @@ class NotifyCog(commands.Cog):
             description=f"**{bc.title}**",
             color=discord.Color.green(),
         )
-        embed.add_field(name="對象", value=role.mention, inline=True)
+        embed.add_field(
+            name="對象",
+            value=target_desc + ("\n🕵️ 匿名寄送" if anonymous else ""),
+            inline=True,
+        )
         embed.add_field(name="成功送達", value=f"{sent} 人", inline=True)
         embed.add_field(name="私訊失敗", value=f"{failed} 人", inline=True)
         if bc.failed:
@@ -277,20 +377,51 @@ class NotifyCog(commands.Cog):
 
     # ------------------------------------------------------------ 指令
 
-    @notify.command(name="send", description="群發私訊通知給指定身分組")
+    @notify.command(
+        name="send", description="群發私訊通知（都不指定對象時會出現成員選單）"
+    )
     @app_commands.describe(
-        role="要通知的身分組",
+        role="要通知的身分組 (選填)",
+        user="要額外通知的單一成員 (選填，可與身分組並用)",
         channel="要附在通知裡的頻道連結 (選填)",
+        anonymous="隱藏寄送者，收件者看不到是誰發的 (預設關閉)",
     )
     async def send(
         self,
         interaction: Interaction,
-        role: discord.Role,
+        role: discord.Role | None = None,
+        user: discord.Member | None = None,
         channel: discord.abc.GuildChannel | None = None,
+        anonymous: bool = False,
     ):
-        log(interaction, role=role.name)
+        log(
+            interaction,
+            role=role.name if role else None,
+            user=str(user) if user else None,
+            anonymous=anonymous,
+        )
+
+        if role is None and user is None:
+            # 沒指定對象 → 先挑人，選單的 callback 再接著跳出填寫視窗
+            await interaction.response.send_message(
+                embed=ui.info_embed(
+                    "請選擇要通知的成員，選完會跳出填寫標題與內容的視窗"
+                ),
+                view=MemberSelectView(self, channel, anonymous),
+                ephemeral=True,
+            )
+            return
+
         # 用 Modal 才能輸入多行內容
-        await interaction.response.send_modal(BroadcastModal(self, role, channel))
+        await interaction.response.send_modal(
+            BroadcastModal(
+                self,
+                role=role,
+                members=[user] if user else None,
+                channel=channel,
+                anonymous=anonymous,
+            )
+        )
 
     @notify.command(name="status", description="查看某則通知誰已讀、誰還沒")
     @app_commands.describe(id="群發編號，可用 /notify list 查看")
@@ -314,8 +445,12 @@ class NotifyCog(commands.Cog):
             description=f"**{bc.title}**\n`{bar}` {len(read)}/{len(bc.delivered)} ({bc.progress:.0%})",
             color=discord.Color.blue(),
         )
-        embed.add_field(name="對象", value=f"<@&{bc.role_id}>", inline=True)
-        embed.add_field(name="發布者", value=f"<@{bc.author_id}>", inline=True)
+        embed.add_field(name="對象", value=target_text(bc), inline=True)
+        embed.add_field(
+            name="發布者",
+            value=f"<@{bc.author_id}>" + ("\n🕵️ 匿名寄送" if bc.anonymous else ""),
+            inline=True,
+        )
         embed.add_field(
             name="發布時間", value=f"{bc.created_dt:%Y-%m-%d %H:%M}", inline=True
         )
@@ -352,7 +487,7 @@ class NotifyCog(commands.Cog):
             embed.add_field(
                 name=f"#{bc.id} {bc.title}",
                 value=(
-                    f"<@&{bc.role_id}> ・ {bc.created_dt:%Y-%m-%d %H:%M}\n"
+                    f"{target_text(bc)} ・ {bc.created_dt:%Y-%m-%d %H:%M}\n"
                     f"已讀 {len(bc.read_ids)}/{len(bc.delivered)} ({bc.progress:.0%})"
                 ),
                 inline=False,
