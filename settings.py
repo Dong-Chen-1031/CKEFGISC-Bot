@@ -63,5 +63,10 @@ def _env_bool(key: str, default: bool) -> bool:
 # 請確定你的伺服器適合這樣開放。改完要重啟機器人才會生效。
 NOTIFY_REQUIRE_PERMISSION = _env_bool("NOTIFY_REQUIRE_PERMISSION", True)
 
+# 是否允許匿名寄送。設成 false 之後 /notify send 的 anonymous 選項會被拒絕，
+# 新發出的通知一律帶上發布者名稱與頭像。
+# 已經發出去的舊通知不受影響（見 README 說明）。改完要重啟機器人才會生效。
+NOTIFY_ALLOW_ANONYMOUS = _env_bool("NOTIFY_ALLOW_ANONYMOUS", True)
+
 # 每封私訊之間間隔幾秒，太短會被 Discord 限流
 NOTIFY_SEND_DELAY = 1.0

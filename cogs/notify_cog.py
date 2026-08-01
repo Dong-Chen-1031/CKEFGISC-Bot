@@ -487,7 +487,7 @@ class NotifyCog(commands.Cog):
         role="要通知的身分組 (選填)",
         user="要額外通知的單一成員 (選填，可與身分組並用)",
         channel="要附在通知裡的頻道連結 (選填)",
-        anonymous="隱藏寄送者，收件者看不到是誰發的 (預設關閉)",
+        anonymous="隱藏寄送者，收件者看不到是誰發的 (預設關閉，伺服器可停用此功能)",
         schedule="排程寄送時間，例如 2025-01-01 09:00 (選填，不填就立刻寄)",
         remind_every="每隔幾小時自動提醒未讀的人 (選填，不填就不提醒)",
         remind_max="自動提醒最多幾次 (預設 3)",
@@ -510,6 +510,18 @@ class NotifyCog(commands.Cog):
             anonymous=anonymous,
             schedule=schedule,
         )
+
+        if anonymous and not settings.NOTIFY_ALLOW_ANONYMOUS:
+            # 寧可擋下來也不要默默改成具名 — 否則發的人會以為自己匿名了
+            await interaction.response.send_message(
+                embed=ui.info_embed(
+                    "這個伺服器已關閉匿名寄送\n"
+                    "（`.env` 的 `NOTIFY_ALLOW_ANONYMOUS=false`）",
+                    discord.Color.red(),
+                ),
+                ephemeral=True,
+            )
+            return
 
         scheduled_at = None
         if schedule:
