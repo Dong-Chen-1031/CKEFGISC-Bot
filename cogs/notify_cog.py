@@ -216,11 +216,28 @@ class NotifyCog(commands.Cog):
         name="notify",
         description="群發私訊通知並追蹤已讀狀況",
         guild_only=True,
-        default_permissions=discord.Permissions(manage_guild=True),
+        # None 代表不限制，所有人都看得到、用得到
+        default_permissions=(
+            discord.Permissions(manage_guild=True)
+            if settings.NOTIFY_REQUIRE_PERMISSION
+            else None
+        ),
     )
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+
+    async def interaction_check(self, interaction: Interaction) -> bool:
+        """再擋一次權限
+
+        default_permissions 只是 Discord 端的「預設」，伺服器管理員可以在
+        設定 → 整合 裡覆寫，所以這裡自己再檢查一次，兩邊都要過才放行。
+        """
+        if not settings.NOTIFY_REQUIRE_PERMISSION:
+            return True
+        if interaction.user.guild_permissions.manage_guild:
+            return True
+        raise app_commands.MissingPermissions(["manage_guild"])
 
     async def cog_load(self):
         self.bot.add_dynamic_items(ReadButton)

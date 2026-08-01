@@ -175,7 +175,32 @@ COUNTDOWN_UPDATE_INTERVAL = 10  # 分鐘，不建議低於 5
 | `/notify remind` | 再私訊提醒一次還沒按已讀的人 |
 | `/notify delete` | 刪除群發紀錄 |
 
-指令預設只有具備「管理伺服器」權限的人看得到。
+### 誰能使用
+
+預設只有具備「管理伺服器」權限的人看得到、用得到。想開放給所有人，在 `.env` 裡加一行：
+
+```env
+NOTIFY_REQUIRE_PERMISSION=false
+```
+
+接受 `true/false`、`1/0`、`yes/no`、`on/off`，不分大小寫；沒設就是 `true`。
+**改完要重啟機器人**才會生效（開機時 `bot.tree.sync()` 會把新的權限設定同步給 Discord）。
+
+權限是兩層一起切的：
+
+| | `true`（預設） | `false` |
+|---|---|---|
+| Discord 端 `default_permissions` | 需要管理伺服器 | 不限制 |
+| Bot 端 `interaction_check` | 再驗一次 | 直接放行 |
+
+之所以要兩層，是因為 `default_permissions` 只是**預設值** —— 伺服器管理員可以在
+「設定 → 整合 → 機器人」裡覆寫它。多一層 bot 端檢查，即使 Discord 端被改開也還是擋得住。
+
+> ⚠️ 關掉之後**任何成員都能用 `/notify send` 一次私訊整個身分組**。
+> 人多的伺服器請三思，這種東西被亂用很煩。
+
+> 另外注意：如果管理員先前已經在「整合」裡手動覆寫過 `/notify` 的權限，
+> 那個覆寫會一直存在，改 `.env` 不會把它清掉，要自己回去那邊移除。
 
 ### 怎麼發
 

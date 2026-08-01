@@ -49,5 +49,19 @@ NOTIFY_DATA_FILE = "data/notifications.json"
 
 # ── 群發通知設定 ──
 
+
+def _env_bool(key: str, default: bool) -> bool:
+    """讀取 .env 裡的布林開關，接受 true/1/yes/on 這類寫法"""
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on", "y")
+
+
+# /notify 是否需要「管理伺服器」權限。
+# 設成 false 之後所有人都能使用 /notify，包含一次私訊整個身分組，
+# 請確定你的伺服器適合這樣開放。改完要重啟機器人才會生效。
+NOTIFY_REQUIRE_PERMISSION = _env_bool("NOTIFY_REQUIRE_PERMISSION", True)
+
 # 每封私訊之間間隔幾秒，太短會被 Discord 限流
 NOTIFY_SEND_DELAY = 1.0
