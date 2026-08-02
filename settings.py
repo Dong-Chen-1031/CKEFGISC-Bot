@@ -68,5 +68,13 @@ NOTIFY_REQUIRE_PERMISSION = _env_bool("NOTIFY_REQUIRE_PERMISSION", True)
 # 已經發出去的舊通知不受影響（見 README 說明）。改完要重啟機器人才會生效。
 NOTIFY_ALLOW_ANONYMOUS = _env_bool("NOTIFY_ALLOW_ANONYMOUS", True)
 
+# ── 表情符號複製 ──
+
+# 每個表符建立之間間隔幾秒。Discord 對建立表符的速率限制很緊，
+# 調太低容易被 429 卡住整批作業。
+EMOJI_COPY_DELAY = 1.5
+
+# ── 群發通知設定（續）──
+
 # 每封私訊之間間隔幾秒，太短會被 Discord 限流
 NOTIFY_SEND_DELAY = 1.0
