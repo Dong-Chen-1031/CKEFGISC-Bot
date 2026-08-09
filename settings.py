@@ -68,6 +68,21 @@ NOTIFY_REQUIRE_PERMISSION = _env_bool("NOTIFY_REQUIRE_PERMISSION", True)
 # 已經發出去的舊通知不受影響（見 README 說明）。改完要重啟機器人才會生效。
 NOTIFY_ALLOW_ANONYMOUS = _env_bool("NOTIFY_ALLOW_ANONYMOUS", True)
 
+# ── 訊息紀錄 ──
+
+# 訊息紀錄的總開關。關掉之後 /msglog 指令會拒絕使用、所有伺服器也一律停止記錄，
+# 但資料庫裡各伺服器的設定會保留，之後再打開就直接恢復。
+# 只有 DEV_ID 裡的開發者能使用 /msglog 指令。改完要重啟機器人才會生效。
+MESSAGE_LOG_ENABLED = _env_bool("MESSAGE_LOG_ENABLED", True)
+
+# 通知裡每段訊息內容最多顯示幾個字，超過的部分會被截斷。
+# 一般使用者單則訊息的上限就是 2000 字，所以預設值代表「正常訊息一律完整記錄」。
+# Discord 單一欄位只吃 1024 字，超過的話會自動拆成多欄呈現（最多 3 欄）。
+MESSAGE_LOG_CONTENT_LIMIT = 2000
+
+# 批次刪除時，彙整通知裡最多列出幾則訊息
+MESSAGE_LOG_BULK_PREVIEW = 10
+
 # ── 表情符號複製 ──
 
 # 每個表符建立之間間隔幾秒。Discord 對建立表符的速率限制很緊，
