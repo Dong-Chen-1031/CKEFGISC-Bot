@@ -76,8 +76,9 @@ NOTIFY_ALLOW_ANONYMOUS = _env_bool("NOTIFY_ALLOW_ANONYMOUS", True)
 MESSAGE_LOG_ENABLED = _env_bool("MESSAGE_LOG_ENABLED", True)
 
 # 通知裡每段訊息內容最多顯示幾個字，超過的部分會被截斷。
-# Discord 單一欄位上限是 1024 字，超過的話會自動拆成多欄呈現。
-MESSAGE_LOG_CONTENT_LIMIT = 1024
+# 一般使用者單則訊息的上限就是 2000 字，所以預設值代表「正常訊息一律完整記錄」。
+# Discord 單一欄位只吃 1024 字，超過的話會自動拆成多欄呈現（最多 3 欄）。
+MESSAGE_LOG_CONTENT_LIMIT = 2000
 
 # 批次刪除時，彙整通知裡最多列出幾則訊息
 MESSAGE_LOG_BULK_PREVIEW = 10

@@ -143,6 +143,7 @@ def set_ignored(
     *,
     channels: list[int] | None = None,
     users: list[int] | None = None,
+    updated_by: int | None = None,
 ) -> MessageLogConfig | None:
     """整批換掉忽略清單
 
@@ -160,6 +161,8 @@ def set_ignored(
         if users is not None:
             row.ignored_users = list(dict.fromkeys(users))
         row.updated_at = now().isoformat()
+        if updated_by is not None:
+            row.updated_by = updated_by
         s.add(row)
         s.commit()
         return row

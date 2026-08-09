@@ -99,6 +99,18 @@ def trim(text: str, limit: int) -> str:
     return text[: limit - 1] + "…"
 
 
+def md(text: str) -> str:
+    """跳脫使用者可控的字串，免得它把我們自己的 markdown 弄壞
+
+    檔名、暱稱這類東西會被塞進 `[名稱](連結)` 或 `**名稱**` 裡，
+    名稱中的 `]` 加 `(` 就能跳出連結、把任意網址送進紀錄頻道。
+    escape_markdown 不處理這兩個字元，所以額外補上。
+
+    訊息內容本身不套這個 —— 那是原文，本來就該保留原本的格式。
+    """
+    return discord.utils.escape_markdown(text).replace("]", "\\]").replace("(", "\\(")
+
+
 def add_text_field(embed: discord.Embed, name: str, text: str) -> None:
     """加一個文字欄位，太長就截斷、必要時拆成好幾欄
 
@@ -146,7 +158,7 @@ def describe_attachments(attachments) -> str:
     """把附件列成一行一個，附上大小與原始連結"""
     lines = []
     for att in attachments:
-        name = att.filename
+        name = md(att.filename)
         if att.is_spoiler():
             name = f"{name}（劇透）"
         note = "語音訊息" if att.is_voice_message() else human_size(att.size)
@@ -356,7 +368,7 @@ class MessageLogCog(commands.Cog):
             add_text_field(
                 embed,
                 f"貼圖（{len(message.stickers)}）",
-                "\n".join(f"・[{s.name}]({s.url})" for s in message.stickers),
+                "\n".join(f"・[{md(s.name)}]({s.url})" for s in message.stickers),
             )
 
         if message.poll is not None:
@@ -464,11 +476,12 @@ class MessageLogCog(commands.Cog):
         channel = self.bot.get_channel(payload.channel_id) or after.channel
         parent_id = channel.parent_id if isinstance(channel, discord.Thread) else None
 
+        # Message.author 的型別是 Union[User, Member]，不會是 None，所以不用防禦
         reason = cfg.ignores(
             channel_id=payload.channel_id,
             parent_id=parent_id,
-            author_id=after.author.id if after.author else None,
-            author_is_bot=bool(after.author and after.author.bot) or bool(after.webhook_id),
+            author_id=after.author.id,
+            author_is_bot=bool(after.author.bot or after.webhook_id),
         )
         if reason:
             return
@@ -513,6 +526,20 @@ class MessageLogCog(commands.Cog):
             return
 
         cached = sorted(payload.cached_messages, key=lambda m: m.created_at)
+        # 逐則再過濾一次：整批刪除裡照樣可能夾著忽略清單上的人或機器人的訊息，
+        # 少了這關就等於從側門把他們的內容寫進紀錄頻道。先濾再取前幾筆，
+        # 否則被濾掉的會佔掉預覽的名額。
+        visible = [
+            m
+            for m in cached
+            if not cfg.ignores(
+                channel_id=payload.channel_id,
+                parent_id=parent_id,
+                author_id=m.author.id,
+                author_is_bot=bool(m.author.bot or m.webhook_id),
+            )
+        ]
+
         embed = discord.Embed(
             title="🧹 訊息被批次刪除",
             color=COLOR_BULK,
@@ -523,9 +550,9 @@ class MessageLogCog(commands.Cog):
             ),
         )
 
-        if cached and cfg.include_content:
+        if visible and cfg.include_content:
             lines = []
-            for message in cached[: settings.MESSAGE_LOG_BULK_PREVIEW]:
+            for message in visible[: settings.MESSAGE_LOG_BULK_PREVIEW]:
                 extras = []
                 if message.attachments:
                     extras.append(f"📎×{len(message.attachments)}")
@@ -533,14 +560,18 @@ class MessageLogCog(commands.Cog):
                     extras.append(f"🖼️×{len(message.stickers)}")
                 suffix = f"　{' '.join(extras)}" if extras else ""
                 body = trim(message.content or "（沒有文字內容）", 120)
-                lines.append(f"**{message.author.display_name}**：{body}{suffix}")
+                lines.append(f"**{md(message.author.display_name)}**：{body}{suffix}")
             add_text_field(embed, f"內容預覽（{len(lines)}／{len(payload.message_ids)}）", "\n".join(lines))
 
+        notes = []
         missing = len(payload.message_ids) - len(cached)
         if missing > 0:
-            embed.add_field(
-                name="備註", value=f"其中 {missing} 則不在快取中，無法取得內容", inline=False
-            )
+            notes.append(f"其中 {missing} 則不在快取中，無法取得內容")
+        skipped = len(cached) - len(visible)
+        if skipped > 0 and cfg.include_content:
+            notes.append(f"{skipped} 則屬於忽略清單，未列出內容")
+        if notes:
+            embed.add_field(name="備註", value="；".join(notes), inline=False)
 
         embed.set_footer(text=f"頻道 ID：{payload.channel_id}")
         await self.send_log(cfg, embed)
@@ -883,11 +914,27 @@ class MessageLogCog(commands.Cog):
             return
 
         if action.value == "clear":
-            cfg = ml.set_ignored(cfg.guild_id, channels=[], users=[])
+            cfg = ml.set_ignored(
+                cfg.guild_id, channels=[], users=[], updated_by=interaction.user.id
+            )
+            if cfg is None:
+                await interaction.followup.send(
+                    embed=ui.info_embed("設定在處理過程中被刪掉了，請重新設定", discord.Color.red())
+                )
+                return
             await interaction.followup.send(embed=self.status_embed(target_guild, cfg))
             return
 
-        raw = (target or "").strip().strip("<>@#&!")
+        raw_input = (target or "").strip()
+        if raw_input.startswith("<@&"):
+            await interaction.followup.send(
+                embed=ui.info_embed(
+                    "忽略清單只支援頻道與使用者，不支援身分組", discord.Color.red()
+                )
+            )
+            return
+
+        raw = raw_input.strip("<>@#&!")
         if not raw.isdigit():
             await interaction.followup.send(
                 embed=ui.info_embed(
@@ -898,7 +945,14 @@ class MessageLogCog(commands.Cog):
             return
 
         target_id = int(raw)
-        is_channel = target_guild.get_channel_or_thread(target_id) is not None
+        # 先看輸入本身的 mention 語法。只靠快取查詢的話，貼一個機器人看不到的頻道 ID
+        # 會被當成使用者寫進 ignored_users，那條規則就永遠不會生效，指令卻回報成功。
+        if raw_input.startswith("<#"):
+            is_channel = True
+        elif raw_input.startswith("<@"):
+            is_channel = False
+        else:
+            is_channel = target_guild.get_channel_or_thread(target_id) is not None
         current = list(cfg.ignored_channels if is_channel else cfg.ignored_users)
         mention = f"<#{target_id}>" if is_channel else f"<@{target_id}>"
 
@@ -921,7 +975,13 @@ class MessageLogCog(commands.Cog):
             cfg.guild_id,
             channels=current if is_channel else None,
             users=None if is_channel else current,
+            updated_by=interaction.user.id,
         )
+        if cfg is None:
+            await interaction.followup.send(
+                embed=ui.info_embed("設定在處理過程中被刪掉了，請重新設定", discord.Color.red())
+            )
+            return
         await interaction.followup.send(embed=self.status_embed(target_guild, cfg))
 
     @msglog.command(name="status", description="查看某個伺服器的訊息紀錄設定")
