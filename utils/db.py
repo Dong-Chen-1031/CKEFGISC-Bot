@@ -1,7 +1,8 @@
 """資料庫連線與初始化
 
-用 SQLModel (SQLAlchemy + SQLite)。所有資料表定義在 utils/countdown.py 和
-utils/notify.py，這裡只負責 engine、session 與開機時的建表 / 自動遷移。
+用 SQLModel (SQLAlchemy + SQLite)。所有資料表定義在 utils/countdown.py、
+utils/notify.py 和 utils/msglog.py，這裡只負責 engine、session 與開機時的
+建表 / 自動遷移。
 """
 
 import logging
@@ -75,8 +76,8 @@ def set_meta(key: str, value: str) -> None:
 
 def init_db() -> None:
     """建表，接著在需要時把舊的 JSON 資料搬進來"""
-    # import 這兩個模組才會把資料表註冊到 SQLModel.metadata
-    from utils import countdown, notify  # noqa: F401
+    # import 這幾個模組才會把資料表註冊到 SQLModel.metadata
+    from utils import countdown, msglog, notify  # noqa: F401
 
     SQLModel.metadata.create_all(engine)
     logging.info(f"資料庫已就緒: {settings.DATABASE_FILE}")
