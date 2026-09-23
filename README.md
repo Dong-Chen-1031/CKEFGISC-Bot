@@ -93,26 +93,6 @@ DEV_ID = [
 python bot.py
 ```
 
-### 5. 邀請機器人進伺服器
-
-機器人登入後會在日誌印出邀請連結，也可以自己把 `<CLIENT_ID>` 換成 Developer Portal 裡的 Application ID：
-
-```
-https://discord.com/oauth2/authorize?client_id=<CLIENT_ID>&permissions=1345342608&scope=bot+applications.commands
-```
-
-連結裡的權限（`1345342608`）對應 `bot.py` 的 `INVITE_PERMISSIONS`：
-
-| 權限 | 用途 |
-|---|---|
-| 檢視頻道、發送訊息、嵌入連結 | 訊息紀錄送通知 |
-| 管理頻道 | 倒數頻道的建立、改名、刪除 |
-| 管理身分組、連線、說話 | 倒數頻道鎖定（改 @everyone 的權限覆寫） |
-| 管理表情符號 | 跨伺服器複製表情符號 |
-| 查看稽核日誌 | 訊息紀錄顯示是誰刪的訊息（選用） |
-
-另外 `bot.py` 使用 `Intents.all()`，記得在 Developer Portal 的 Bot 頁面打開 **Presence**、**Server Members**、**Message Content** 三個特權 Intent，否則機器人會登入失敗。
-
 ## ⏳ 日期倒數頻道
 
 用語音頻道的名稱來顯示日期倒數，頻道預設會被鎖起來（大家看得到但不能加入），純粹當公佈欄用。
@@ -187,8 +167,7 @@ COUNTDOWN_UPDATE_INTERVAL = 10  # 分鐘，不建議低於 5
 
 ### 機器人需要的權限
 
-- **管理頻道** — 建立頻道、改名、刪除
-- **管理身分組**、**連線**、**說話** — 鎖定頻道時要改 @everyone 的權限覆寫
+- **管理頻道** — 建立頻道、改名、設定權限
 - 建議把機器人的身分組放在夠高的位置，否則改不動頻道
 
 ## 📨 群發通知（已讀追蹤）

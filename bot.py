@@ -19,28 +19,9 @@ intents = discord.Intents.all()
 
 bot = commands.Bot(command_prefix=settings.PREFIX, intents=intents)
 
-# 邀請連結要求的權限，對應各個 Cog 實際會用到的功能
-INVITE_PERMISSIONS = discord.Permissions(
-    view_channel=True,        # 看得到頻道
-    send_messages=True,       # 訊息紀錄送通知
-    embed_links=True,         # 通知都是 Embed
-    manage_channels=True,     # 倒數：建立、改名、刪除頻道
-    manage_roles=True,        # 倒數：設定頻道權限覆寫（鎖頻道）
-    connect=True,             # 倒數：鎖頻道時要能覆寫「連線」
-    speak=True,               # 倒數：鎖頻道時要能覆寫「說話」
-    manage_expressions=True,  # 複製表情符號
-    view_audit_log=True,      # 訊息紀錄：從稽核紀錄查刪除者
-)
-
 @bot.event
 async def on_ready():
     logging.info(f'已登入為 {bot.user.name}')
-    invite = discord.utils.oauth_url(
-        bot.user.id,
-        permissions=INVITE_PERMISSIONS,
-        scopes=('bot', 'applications.commands'),
-    )
-    logging.info(f'邀請連結: {invite}')
     try:
         synced = await bot.tree.sync()
         logging.info(f'已同步 {len(synced)} 個斜線指令')
