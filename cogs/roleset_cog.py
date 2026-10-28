@@ -25,6 +25,8 @@ SYNC_REASON = "衍伸身分組自動同步"
 # 預覽與清單裡最多列出幾位成員
 PREVIEW_MEMBERS = 40
 FIELD_LIMIT = 1024
+# 自動補全最多算幾次「成員 × 選項」的人數，超過就不附人數
+AUTOCOMPLETE_BUDGET = 200_000
 # 運算式寫錯時附在錯誤訊息後面
 HELP_HINT = "語法可以用 /roleset help 查看"
 
@@ -245,26 +247,28 @@ class RoleSetCog(commands.Cog):
     async def expression_autocomplete(
         self, interaction: Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
-        """補全最後一個還沒打完的身分組或成員名稱，前面已經打好的部分原樣保留"""
+        """依游標位置建議下一步，並在選項後面附上套用後的人數（規則見 rs.Completer）"""
         guild = interaction.guild
         if guild is None:
             return []
 
-        start = len(current)
-        while start > 0 and not current[start - 1].isspace() and current[start - 1] not in rs.STOP_CHARS:
-            start -= 1
-        prefix, partial = current[:start], current[start:].lstrip("@").lower()
-
+        completer = rs.Completer(guild)
+        values = completer.suggest(current)
+        # 每個選項都要把全部成員算一次，人多的伺服器只算前面幾個，免得超過 3 秒的回應期限
+        budget = AUTOCOMPLETE_BUDGET
+        member_sets = None
         choices = []
-        for role in reversed(guild.roles):  # 由高到低
-            if role.is_default() or (partial and partial not in role.name.lower()):
-                continue
-            value = prefix + rs.name_token(role.name)
-            if len(value) > 100:  # 選項值的上限，太長就只能自己打了
-                continue
-            choices.append(app_commands.Choice(name=value, value=value))
-            if len(choices) >= 25:
-                return choices
+        for value in values:
+            name = value
+            if budget >= len(guild.members):
+                node = completer.node(value)
+                if node is not None:
+                    if member_sets is None:
+                        member_sets = [rs.member_roles(m) for m in guild.members]
+                    budget -= len(member_sets)
+                    name = rs.with_hint(value, sum(1 for ids in member_sets if node.matches(ids)))
+            choices.append(app_commands.Choice(name=name, value=value))
+        return choices
 
         # 有打字才列成員，不然清單會被一堆不相干的人塞滿
         if not partial:
@@ -528,6 +532,14 @@ class RoleSetCog(commands.Cog):
                 "・名稱：`幹部` 或 `@幹部`；找不到身分組才會找同名的成員\n"
                 "・名稱有空白或符號時加引號：`\"高三 甲\"`、`「a-b」`\n"
                 "・身分組或成員的 ID：`123456789`"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="自動補全",
+            value=(
+                "輸入框會依目前打到哪裡建議身分組、成員或運算子，"
+                "選項後面的「→ N 人」是選了之後的人數"
             ),
             inline=False,
         )

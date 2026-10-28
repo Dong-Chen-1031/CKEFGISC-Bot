@@ -277,9 +277,11 @@ class Parser:
     primary := "(" expr ")" | "*" | 身分組
     """
 
-    def __init__(self, text: str, guild=None):
+    def __init__(self, text: str, guild=None, index: dict | None = None):
         self.text = text
         self.guild = guild
+        # 成員名稱索引（見 member_index），沒給就在需要時現場掃一遍
+        self.index = index
         self.tokens = tokenize(text)
         self.i = 0
 
@@ -388,13 +390,10 @@ class Parser:
                 raise ExprError(f"有 {len(found)} 個身分組都叫「{wanted}」，請改用提及或 ID")
 
         # 沒有這個名稱的身分組，再找成員（帳號名稱、顯示名稱、伺服器暱稱都算）
+        if self.index is None:
+            self.index = member_index(self.guild.members)
         for wanted in candidates:
-            lowered = wanted.lower()
-            found = [
-                m
-                for m in self.guild.members
-                if lowered in {(n or "").lower() for n in (m.name, m.global_name, m.nick)}
-            ]
+            found = self.index.get(wanted.lower(), [])
             if len(found) == 1:
                 return UserRef(found[0].id)
             if len(found) > 1:
@@ -402,13 +401,24 @@ class Parser:
         raise ExprError(f"第 {token.pos} 個字：找不到叫「{name}」的身分組或成員")
 
 
-def parse(text: str, guild=None) -> Node:
+def member_index(members) -> dict[str, list]:
+    """小寫名稱 -> 叫這個名字的成員（帳號名稱、顯示名稱、伺服器暱稱都算，同一人只算一次）"""
+    index: dict[str, list] = {}
+    for member in members:
+        for name in {(n or "").lower() for n in (member.name, member.global_name, member.nick)} - {""}:
+            index.setdefault(name, []).append(member)
+    return index
+
+
+def parse(text: str, guild=None, index: dict | None = None) -> Node:
     """解析運算式
 
     給 guild 的話會把名稱換成 ID、並確認身分組存在；
     不給的話只接受 ID / 提及（讀資料庫裡的標準形式時用）。
+    自動補全附在選項後面的人數提示（見 with_hint）會先拿掉。
+    一次要解析很多段時（自動補全）可以傳入 member_index() 的結果，省得每次重掃成員。
     """
-    return Parser(text, guild).parse()
+    return Parser(strip_hints(text), guild, index).parse()
 
 
 def display(expression: str) -> str:
@@ -539,6 +549,217 @@ def chunk_mentions(
     if current:
         messages.append((current, ids))
     return messages
+
+
+# ---------------------------------------------------------------- 自動補全
+
+# 選項顯示的名稱會附上「→ N 人」。有些 Discord 用戶端選了選項之後輸入框裡顯示的是名稱，
+# 使用者接著打字就會把提示一起送出來，所以解析前一律先拿掉
+HINT = re.compile(r"　→ [\d,]+ 人")
+# Discord 自動補全選項的名稱與值都限 100 字
+CHOICE_LIMIT = 100
+BINARY_OPS = ("|", "&", "-", "^")
+OPERAND_START = ("~", "&", "|", "-", "^", "(")
+
+
+def strip_hints(text: str) -> str:
+    return HINT.sub("", text)
+
+
+def with_hint(value: str, count: int) -> str:
+    name = f"{value}　→ {count:,} 人"
+    return name if len(name) <= CHOICE_LIMIT else value
+
+
+def split_partial(text: str) -> tuple[str, str, bool]:
+    """切成 (前面已經打好的, 最後一個還沒打完的名稱, 名稱是不是在引號裡)"""
+    open_quote = None
+    for i, ch in enumerate(text):
+        if open_quote is not None:
+            if ch == QUOTES[text[open_quote]]:
+                open_quote = None
+        elif ch in QUOTES:
+            open_quote = i
+    if open_quote is not None:
+        return text[:open_quote], text[open_quote + 1 :], True
+
+    start = len(text)
+    while start > 0 and not text[start - 1].isspace() and text[start - 1] not in STOP_CHARS:
+        start -= 1
+    return text[:start], text[start:], False
+
+
+def match_score(name: str | None, query: str) -> int | None:
+    """0 = 完全相同、1 = 開頭相同、2 = 包含，不相干回傳 None"""
+    if not name:
+        return None
+    name = name.lower()
+    if name == query:
+        return 0
+    if name.startswith(query):
+        return 1
+    if query in name:
+        return 2
+    return None
+
+
+class Completer:
+    """依游標前的內容猜下一步要打什麼
+
+    - 正在打名稱：列出符合的身分組、關鍵字、成員，完全相同 ＞ 開頭相同 ＞ 包含
+    - 該接運算元了（開頭、運算子或左括號後面）：列出身分組與關鍵字
+    - 該接運算子了（名稱或右括號後面）：列出 | & - ^，括號沒關的話也提供 )
+    已經打好的提及會換成比較短的名稱（換了之後還是指向同一個對象才換），
+    讓長一點的運算式也塞得進 100 字的選項上限。
+    """
+
+    def __init__(self, guild):
+        self.guild = guild
+        self.index = member_index(guild.members)
+
+    def suggest(self, current: str, limit: int = 25) -> list[str]:
+        text = strip_hints(current)
+        prefix, partial, quoted = split_partial(text)
+        prefix = self.shorten(prefix)
+
+        values: list[str] = []
+        if partial or quoted:
+            values += [prefix + token for token in self.operands(partial, quoted)]
+            # 括號還沒關的話，最符合的那個順便提供關好括號的版本
+            if values and self.paren_depth(prefix) > 0:
+                values.insert(1, values[0] + ")" * self.paren_depth(prefix))
+        elif self.expects_operand(prefix):
+            values += [prefix + token for token in self.starters(limit)]
+        else:
+            base = prefix.rstrip()
+            values.append(base)
+            if self.paren_depth(base) > 0:
+                values.append(base + ")")
+            values += [f"{base} {op} " for op in BINARY_OPS]
+
+        # 目前整段已經是合法的運算式，就放在第一個，選了等於照原樣送出；
+        # 其他寫法不同、但指向同一個對象的建議（例如打帳號名稱時的顯示名稱）就不重複列
+        whole = (prefix + partial).rstrip()
+        current_node = self.node(whole) if not quoted and whole.strip() else None
+        if current_node is not None:
+            values = [whole] + [v for v in values if self.node(v) != current_node]
+
+        result, seen = [], set()
+        for value in values:
+            key = value.rstrip()
+            if not key.strip() or key in seen or len(value) > CHOICE_LIMIT:
+                continue
+            seen.add(key)
+            result.append(value)
+            if len(result) >= limit:
+                break
+        return result
+
+    # ------------------------------------------------------------ 判斷位置
+
+    @staticmethod
+    def expects_operand(prefix: str) -> bool:
+        try:
+            tokens = tokenize(prefix)
+        except ExprError:
+            return True
+        return not tokens or tokens[-1].kind in OPERAND_START
+
+    @staticmethod
+    def paren_depth(text: str) -> int:
+        try:
+            tokens = tokenize(text)
+        except ExprError:
+            return 0
+        return sum(1 if t.kind == "(" else -1 if t.kind == ")" else 0 for t in tokens)
+
+    def node(self, text: str) -> Node | None:
+        try:
+            return parse(text, self.guild, self.index)
+        except ExprError:
+            return None
+
+    # ------------------------------------------------------------ 候選
+
+    def roles(self) -> list:
+        """由高到低，不含 @everyone"""
+        return sorted(
+            (r for r in self.guild.roles if not r.is_default()),
+            key=lambda r: getattr(r, "position", 0),
+            reverse=True,
+        )
+
+    def starters(self, limit: int) -> list[str]:
+        extras = ["*", "bot", "human", "(", "~"]
+        roles = [name_token(r.name) for r in self.roles()]
+        return roles[: max(limit - len(extras), 0)] + extras
+
+    def operands(self, partial: str, quoted: bool) -> list[str]:
+        query = partial.lower()
+        if not quoted and query.startswith("@") and len(query) > 1:
+            query = query[1:]  # 習慣打 @幹部 的寫法
+
+        ranked: list[tuple[int, int, str, str]] = []  # (分數, 種類, 排序用, 要填入的文字)
+
+        for i, role in enumerate(self.roles()):
+            score = match_score(role.name, query)
+            if score is not None:
+                ranked.append((score, 0, f"{i:06d}", name_token(role.name)))
+
+        if not quoted:
+            for key, aliases in KEYWORDS.items():
+                hits = [(match_score(a, partial.lower()), a) for a in (*aliases, key)]
+                hits = [(sc, a) for sc, a in hits if sc is not None]
+                if hits:
+                    score, alias = min(hits)
+                    ranked.append((score, 1, alias, alias))
+
+        role_names = {r.name.lower() for r in self.guild.roles}
+        for member in self.guild.members:
+            names = (member.nick, member.global_name, member.name)
+            scores = [sc for n in names if (sc := match_score(n, query)) is not None]
+            if not scores:
+                continue
+            # 跟身分組撞名、或有人同名時，解析會選到別的，改用 ID
+            name = member.display_name
+            clash = name.lower() in role_names or len(self.index.get(name.lower(), [])) > 1
+            token = str(member.id) if clash else name_token(name)
+            ranked.append((min(scores), 2, name.lower(), token))
+
+        ranked.sort()
+        return [token for *_, token in ranked]
+
+    # ------------------------------------------------------------ 縮短提及
+
+    def shorten(self, text: str) -> str:
+        def replace(match: re.Match, name: str | None, node: Node) -> str:
+            if not name:
+                return match.group(0)
+            token = name_token(name)
+            if self.node(token) != node:
+                return match.group(0)
+            # 前後黏著別的名稱的話補空白，免得兩個名稱黏成一個
+            source = match.string
+            before = source[match.start() - 1] if match.start() > 0 else " "
+            after = source[match.end()] if match.end() < len(source) else " "
+            if not before.isspace() and before not in OPERATORS:
+                token = " " + token
+            if not after.isspace() and after not in OPERATORS:
+                token += " "
+            return token
+
+        def role(match: re.Match) -> str:
+            role_id = int(match.group(1))
+            found = self.guild.get_role(role_id)
+            return replace(match, found.name if found else None, RoleRef(role_id))
+
+        def user(match: re.Match) -> str:
+            user_id = int(match.group(1))
+            found = self.guild.get_member(user_id)
+            return replace(match, found.display_name if found else None, UserRef(user_id))
+
+        text = ROLE_MENTION.sub(role, text)
+        return USER_MENTION.sub(user, text)
 
 
 # ---------------------------------------------------------------- 資料表
