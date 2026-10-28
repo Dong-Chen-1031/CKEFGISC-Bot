@@ -35,6 +35,7 @@ STOP_CHARS = set(OPERATORS) | {'"', "「", "」", "<", ">"}
 QUOTES = {'"': '"', "「": "」"}
 ROLE_MENTION = re.compile(r"<@&(\d+)>")
 USER_MENTION = re.compile(r"<@!?(\d+)>")
+ANY_MENTION = re.compile(r"<@([&!]?)(\d+)>")
 # 不是身分組、但可以當成集合用的關鍵字（不分大小寫，加引號就會當成身分組名稱）
 KEYWORDS = {
     "*": ("everyone", "@everyone", "全體"),
@@ -421,17 +422,24 @@ def parse(text: str, guild=None, index: dict | None = None) -> Node:
     return Parser(strip_hints(text), guild, index).parse()
 
 
-def display(expression: str) -> str:
+def display(expression: str, label=None) -> str:
     """把標準形式轉成能安全放進 Discord 訊息的樣子
 
     `* - <@&1>` 直接送出去會在行首被當成兩層清單、`~~<@&1>` 會變刪除線，
-    所以運算子都加上反斜線；身分組提及保持原樣，才會繼續顯示成身分組。
+    所以運算子都加上反斜線。提及預設保持原樣，在嵌入裡會顯示成身分組／成員。
+
+    label(is_role, id) 有給的話，提及改成它回傳的純文字（呼叫端負責跳脫）。
+    一般訊息要用這個：提及在訊息裡會顯示成 @ 的樣子，就算沒有真的通知到，
+    被排除的人看起來也像被 @ 了。
     """
     parts = []
     last = 0
-    for mention in ROLE_MENTION.finditer(expression):
+    for mention in ANY_MENTION.finditer(expression):
         parts.append(MD_SPECIAL.sub(r"\\\1", expression[last : mention.start()]))
-        parts.append(mention.group(0))
+        if label is None:
+            parts.append(mention.group(0))
+        else:
+            parts.append(label(mention.group(1) == "&", int(mention.group(2))))
         last = mention.end()
     parts.append(MD_SPECIAL.sub(r"\\\1", expression[last:]))
     return "".join(parts)

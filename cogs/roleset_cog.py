@@ -54,6 +54,25 @@ def role_problem(role: discord.Role, user: discord.Member) -> str | None:
     return None
 
 
+def plain_expression(node: rs.Node, guild: discord.Guild) -> str:
+    """運算式寫成純文字，身分組與成員只顯示名稱、不用提及格式
+
+    給一般訊息用：訊息裡的 <@成員> 一定會顯示成 @ 的樣子，
+    `@執秘 - @某人` 裡被排除的人就算沒收到通知，看起來也像被 @ 了。
+    """
+
+    def label(is_role: bool, target_id: int) -> str:
+        if is_role:
+            found = guild.get_role(target_id)
+            name = found.name if found else "已刪除的身分組"
+        else:
+            found = guild.get_member(target_id)
+            name = found.display_name if found else "不在伺服器的成員"
+        return "@" + discord.utils.escape_markdown(name)
+
+    return rs.display(node.canonical(), label)
+
+
 def member_list(members: list[discord.Member], limit: int = PREVIEW_MEMBERS) -> str:
     text = " ".join(m.mention for m in members[:limit])
     if len(members) > limit:
@@ -657,7 +676,7 @@ class RoleSetCog(commands.Cog):
         members: list[discord.Member],
         message: str | None,
     ):
-        header = f"📢 **{discord.utils.escape_markdown(interaction.user.display_name)}** 提及了 {node.display()}（{len(members)} 人）"
+        header = f"📢 **{discord.utils.escape_markdown(interaction.user.display_name)}** 提及了 {plain_expression(node, interaction.guild)}（{len(members)} 人）"
         if message:
             header += f"\n{message}"
         chunks = rs.chunk_mentions(header, [m.id for m in members])
