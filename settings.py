@@ -89,6 +89,20 @@ MESSAGE_LOG_BULK_PREVIEW = 10
 # 調太低容易被 429 卡住整批作業。
 EMOJI_COPY_DELAY = 1.5
 
+# ── 身分組集合 ──
+
+# 每幾分鐘把所有衍伸身分組完整校正一次，補上事件漏掉或機器人離線期間的變動
+ROLESET_SYNC_INTERVAL = 30
+
+# 整批校正時，每改一位成員之間間隔幾秒，避免被 Discord 限流
+ROLESET_EDIT_DELAY = 0.5
+
+# /roleset mention 超過幾人要先按確認
+ROLESET_MENTION_CONFIRM = 20
+
+# /roleset mention 一次最多提及幾人，超過直接拒絕
+ROLESET_MENTION_MAX = 300
+
 # ── 群發通知設定（續）──
 
 # 每封私訊之間間隔幾秒，太短會被 Discord 限流

@@ -1,0 +1,607 @@
+"""身分組集合
+
+用集合運算描述一群成員，例如 `(@幹部 | @顧問) - @畢業生`，然後：
+- 衍伸身分組：把某個身分組綁上運算式，機器人自動增減成員讓它等於運算結果
+- 提及集合：一次 @ 運算結果裡的所有成員
+
+衍伸身分組靠 on_member_update 即時同步，另外定期整個伺服器校正一次，
+補上事件漏掉或機器人離線期間的變動。運算式語法見 utils/roleset.py。
+"""
+
+import asyncio
+import logging
+from collections import defaultdict
+
+import discord
+from discord import Interaction, app_commands
+from discord.ext import commands, tasks
+
+import settings
+from utils import roleset as rs
+from utils import ui
+from utils.log import log
+
+SYNC_REASON = "衍伸身分組自動同步"
+# 預覽與清單裡最多列出幾位成員
+PREVIEW_MEMBERS = 40
+FIELD_LIMIT = 1024
+
+
+def trim(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def role_problem(role: discord.Role, user: discord.Member) -> str | None:
+    """這個身分組能不能拿來當衍伸身分組，不行的話回傳原因"""
+    guild = role.guild
+    if role.is_default():
+        return "不能把 @everyone 設成衍伸身分組"
+    if role.managed:
+        return f"{role.mention} 由整合（機器人、加成等）管理，無法手動指派"
+    me = guild.me
+    if not me.guild_permissions.manage_roles:
+        return "我沒有「管理身分組」權限"
+    if role >= me.top_role:
+        return f"{role.mention} 不低於我的最高身分組，請把我的身分組拉到它上面"
+    if user.id != guild.owner_id and role >= user.top_role:
+        return f"{role.mention} 不低於你的最高身分組，你不能管理它"
+    return None
+
+
+def member_list(members: list[discord.Member], limit: int = PREVIEW_MEMBERS) -> str:
+    text = " ".join(m.mention for m in members[:limit])
+    if len(members) > limit:
+        text += f" …等 {len(members)} 人"
+    return trim(text, FIELD_LIMIT) or "*（沒有人）*"
+
+
+class ConfirmView(discord.ui.View):
+    """會動到很多人的操作先讓使用者確認一次，確認後呼叫 on_confirm(interaction)"""
+
+    def __init__(self, author_id: int, on_confirm, label: str):
+        super().__init__(timeout=120)
+        self.author_id = author_id
+        self.on_confirm = on_confirm
+        self.confirm.label = label
+
+    async def interaction_check(self, interaction: Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                embed=ui.info_embed("這不是你的操作", discord.Color.red()),
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="確認", emoji="✅", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: Interaction, _button: discord.ui.Button):
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(view=self)
+        self.stop()
+        await self.on_confirm(interaction)
+
+    @discord.ui.button(label="取消", emoji="✖️", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: Interaction, _button: discord.ui.Button):
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(embed=ui.info_embed("已取消"), view=self)
+        self.stop()
+
+
+class RoleSetCog(commands.Cog):
+    """衍伸身分組與集合提及"""
+
+    # 各子指令需要的權限不同（preview 所有人都能用），所以群組不掛 default_permissions，
+    # 改在每個指令上各自檢查
+    roleset = app_commands.Group(
+        name="roleset",
+        description="身分組集合：衍伸身分組與集合提及",
+        guild_only=True,
+    )
+
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        # 事件同步與整批校正不能同時改同一個伺服器
+        self.locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+        # guild_id -> 排序好的規則；設定一改就清掉
+        self.rule_cache: dict[int, list[rs.Rule]] = {}
+
+    async def cog_load(self):
+        self.sync_loop.start()
+
+    async def cog_unload(self):
+        self.sync_loop.cancel()
+
+    # ------------------------------------------------------------ 規則快取
+
+    def rules(self, guild_id: int) -> list[rs.Rule]:
+        if guild_id not in self.rule_cache:
+            self.rule_cache[guild_id] = rs.load_rules(guild_id)
+        return self.rule_cache[guild_id]
+
+    def watched_roles(self, guild_id: int) -> set[int]:
+        """變動時需要重算的身分組：被引用的，加上衍伸身分組本身（被手動改了要改回來）"""
+        watched = set()
+        for role_id, node in self.rules(guild_id):
+            watched.add(role_id)
+            watched |= node.roles()
+        return watched
+
+    def invalidate(self, guild_id: int):
+        self.rule_cache.pop(guild_id, None)
+
+    # ------------------------------------------------------------ 同步
+
+    async def apply_member(self, member: discord.Member, rules: list[rs.Rule]) -> bool:
+        """把一位成員的衍伸身分組改成應有的樣子，有改動就回傳 True
+
+        呼叫端要先拿到伺服器的鎖。權限不足等錯誤會往上丟。
+        """
+        if member.bot or not rules:
+            return False
+
+        current = {r.id for r in member.roles}
+        target = rs.apply_rules(current, rules)
+        guild = member.guild
+        to_add = [r for i in target - current if (r := guild.get_role(i))]
+        to_remove = [r for i in current - target if (r := guild.get_role(i))]
+        if not to_add and not to_remove:
+            return False
+
+        if to_add:
+            await member.add_roles(*to_add, reason=SYNC_REASON)
+        if to_remove:
+            await member.remove_roles(*to_remove, reason=SYNC_REASON)
+        return True
+
+    async def sync_member(self, guild: discord.Guild, member_id: int):
+        """事件觸發的單人同步，錯誤只記 log"""
+        async with self.locks[guild.id]:
+            # 等鎖的期間成員可能又變了，重新拿一次最新的
+            member = guild.get_member(member_id)
+            if member is None:
+                return
+            try:
+                await self.apply_member(member, self.rules(guild.id))
+            except discord.HTTPException as e:
+                logging.warning(f"衍伸身分組：同步 {member} ({guild.name}) 失敗: {e}")
+
+    async def sync_guild(self, guild: discord.Guild) -> tuple[int, int]:
+        """整個伺服器校正一次，回傳 (改動人數, 失敗人數)"""
+        changed = failed = 0
+        async with self.locks[guild.id]:
+            rules = self.rules(guild.id)
+            if not rules:
+                return 0, 0
+            if not guild.chunked:
+                await guild.chunk()
+            for member in list(guild.members):
+                try:
+                    if await self.apply_member(member, rules):
+                        changed += 1
+                        await asyncio.sleep(settings.ROLESET_EDIT_DELAY)
+                except discord.HTTPException as e:
+                    failed += 1
+                    logging.warning(f"衍伸身分組：同步 {member} ({guild.name}) 失敗: {e}")
+        if changed or failed:
+            logging.info(f"衍伸身分組：{guild.name} 校正完成，改動 {changed} 人、失敗 {failed} 人")
+        return changed, failed
+
+    @tasks.loop(minutes=settings.ROLESET_SYNC_INTERVAL)
+    async def sync_loop(self):
+        # 第一次執行就在剛開機時，順便補上離線期間的變動
+        for guild_id in rs.all_guild_ids():
+            guild = self.bot.get_guild(guild_id)
+            if guild is not None:
+                await self.sync_guild(guild)
+
+    @sync_loop.before_loop
+    async def before_sync_loop(self):
+        await self.bot.wait_until_ready()
+
+    # ------------------------------------------------------------ 事件
+
+    @commands.Cog.listener()
+    async def on_member_update(self, before: discord.Member, after: discord.Member):
+        if before.roles == after.roles or after.bot:
+            return
+        changed = {r.id for r in before.roles} ^ {r.id for r in after.roles}
+        if changed & self.watched_roles(after.guild.id):
+            await self.sync_member(after.guild, after.id)
+
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member):
+        # 補集（例如 ~@已驗證）會包含剛加入的人
+        if not member.bot and self.rules(member.guild.id):
+            await self.sync_member(member.guild, member.id)
+
+    @commands.Cog.listener()
+    async def on_guild_role_delete(self, role: discord.Role):
+        guild_id = role.guild.id
+        if rs.delete_derived(role.id):
+            logging.info(f"衍伸身分組：{role.name} 被刪除，已移除設定")
+
+        for row in rs.guild_derived(guild_id):
+            if row.enabled and role.id in row.node.roles():
+                row.enabled = False
+                rs.save_derived(row)
+                logging.warning(
+                    f"衍伸身分組：<@&{row.role_id}> 引用的身分組 {role.name} 被刪除，已停用"
+                )
+        self.invalidate(guild_id)
+
+    # ------------------------------------------------------------ 指令用小工具
+
+    async def error(self, interaction: Interaction, message: str):
+        await interaction.followup.send(
+            embed=ui.info_embed(message, discord.Color.red()), ephemeral=True
+        )
+
+    async def expression_autocomplete(
+        self, interaction: Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        """補全最後一個還沒打完的身分組名稱，前面已經打好的部分原樣保留"""
+        guild = interaction.guild
+        if guild is None:
+            return []
+
+        start = len(current)
+        while start > 0 and not current[start - 1].isspace() and current[start - 1] not in rs.STOP_CHARS:
+            start -= 1
+        prefix, partial = current[:start], current[start:].lstrip("@").lower()
+
+        choices = []
+        for role in reversed(guild.roles):  # 由高到低
+            if role.is_default() or (partial and partial not in role.name.lower()):
+                continue
+            value = prefix + rs.name_token(role.name)
+            if len(value) > 100:  # 選項值的上限，太長就只能自己打了
+                continue
+            choices.append(app_commands.Choice(name=value, value=value))
+            if len(choices) >= 25:
+                break
+        return choices
+
+    def preview_changes(
+        self, guild: discord.Guild, role_id: int, node: rs.Node
+    ) -> dict[int, tuple[int, int]]:
+        """套上新規則後，各衍伸身分組會 (加入, 移除) 幾個人"""
+        rules = [(rid, n) for rid, n in self.rules(guild.id) if rid != role_id]
+        rules = rs.order_rules(rules + [(role_id, node)])
+
+        diff: dict[int, list[int]] = defaultdict(lambda: [0, 0])
+        for member in guild.members:
+            if member.bot:
+                continue
+            current = {r.id for r in member.roles}
+            target = rs.apply_rules(current, rules)
+            for rid in target - current:
+                diff[rid][0] += 1
+            for rid in current - target:
+                diff[rid][1] += 1
+        return {rid: (a, r) for rid, (a, r) in diff.items()}
+
+    # ------------------------------------------------------------ 衍伸身分組
+
+    @roleset.command(name="derive", description="把現有身分組設成衍伸身分組，成員會自動跟著運算式變動")
+    @app_commands.describe(
+        role="要自動維護的身分組（原有成員會被調整成運算結果）",
+        expression="集合運算式，例如 (@幹部 | @顧問) - @畢業生",
+    )
+    @app_commands.checks.has_permissions(manage_roles=True)
+    async def derive(self, interaction: Interaction, role: discord.Role, expression: str):
+        log(interaction, role=role.name, expression=expression)
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+
+        problem = role_problem(role, interaction.user)
+        if problem:
+            await self.error(interaction, problem)
+            return
+        try:
+            node = rs.parse(expression, guild)
+        except rs.ExprError as e:
+            await self.error(interaction, f"運算式有誤：{e}")
+            return
+        cycle = rs.find_cycle(role.id, node, rs.dependency_graph(guild.id, exclude=role.id))
+        if cycle:
+            path = " → ".join(f"<@&{i}>" for i in cycle)
+            await self.error(interaction, f"這樣會形成循環：{path}")
+            return
+
+        if not guild.chunked:
+            await guild.chunk()
+        changes = self.preview_changes(guild, role.id, node)
+        added, removed = changes.get(role.id, (0, 0))
+
+        old = rs.get_derived(role.id)
+        embed = discord.Embed(
+            title="🧮 設定衍伸身分組",
+            description=f"{role.mention} = {node.canonical()}",
+            color=discord.Color.blurple(),
+        )
+        if old is not None:
+            embed.add_field(name="原本的運算式", value=trim(old.expression, FIELD_LIMIT), inline=False)
+        embed.add_field(name="➕ 會加入", value=f"{added} 人", inline=True)
+        embed.add_field(name="➖ 會移除", value=f"{removed} 人", inline=True)
+        others = [
+            f"<@&{rid}> +{a} / -{r}" for rid, (a, r) in changes.items() if rid != role.id
+        ]
+        if others:
+            embed.add_field(name="連動的其他衍伸身分組", value=trim("\n".join(others), FIELD_LIMIT), inline=False)
+        embed.set_footer(text="確認後會立刻同步，之後成員變動時也會自動調整")
+
+        async def on_confirm(button_interaction: Interaction):
+            # 等按鈕的期間別人可能也改了設定，存檔前再擋一次循環
+            if rs.find_cycle(role.id, node, rs.dependency_graph(guild.id, exclude=role.id)):
+                await button_interaction.followup.send(
+                    embed=ui.info_embed("設定在這段期間被改過，現在會形成循環，請重新操作", discord.Color.red()),
+                    ephemeral=True,
+                )
+                return
+            rs.save_derived(
+                rs.DerivedRole(
+                    role_id=role.id,
+                    guild_id=guild.id,
+                    expression=node.canonical(),
+                    created_by=interaction.user.id,
+                )
+            )
+            self.invalidate(guild.id)
+            await self.report_sync(button_interaction, guild, f"✅ 已將 {role.mention} 設成衍伸身分組")
+
+        await interaction.followup.send(
+            embed=embed, view=ConfirmView(interaction.user.id, on_confirm, "套用"), ephemeral=True
+        )
+
+    @roleset.command(name="create", description="建立一個新的衍伸身分組")
+    @app_commands.describe(
+        name="新身分組的名稱",
+        expression="集合運算式，例如 @高一 & ~@已繳費",
+    )
+    @app_commands.checks.has_permissions(manage_roles=True)
+    async def create(
+        self,
+        interaction: Interaction,
+        name: app_commands.Range[str, 1, 100],
+        expression: str,
+    ):
+        log(interaction, name=name, expression=expression)
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+
+        if not guild.me.guild_permissions.manage_roles:
+            await self.error(interaction, "我沒有「管理身分組」權限")
+            return
+        try:
+            node = rs.parse(expression, guild)
+        except rs.ExprError as e:
+            await self.error(interaction, f"運算式有誤：{e}")
+            return
+
+        try:
+            role = await guild.create_role(
+                name=name, reason=f"{interaction.user} 建立衍伸身分組：{node.canonical()}"
+            )
+        except discord.HTTPException as e:
+            await self.error(interaction, f"建立身分組失敗：{e}")
+            return
+
+        # 新身分組還沒被任何人引用，不可能形成循環
+        rs.save_derived(
+            rs.DerivedRole(
+                role_id=role.id,
+                guild_id=guild.id,
+                expression=node.canonical(),
+                created_by=interaction.user.id,
+            )
+        )
+        self.invalidate(guild.id)
+        await self.report_sync(interaction, guild, f"✅ 已建立 {role.mention} = {node.canonical()}")
+
+    async def report_sync(self, interaction: Interaction, guild: discord.Guild, title: str):
+        """立刻校正一次並回報結果"""
+        changed, failed = await self.sync_guild(guild)
+        text = f"{title}\n已同步 {changed} 位成員"
+        if failed:
+            text += f"，{failed} 位失敗（請確認我的身分組位置夠高）"
+        color = discord.Color.green() if not failed else discord.Color.orange()
+        await interaction.followup.send(embed=ui.info_embed(text, color), ephemeral=True)
+
+    @roleset.command(name="remove", description="停止自動維護某個衍伸身分組（身分組與成員保留）")
+    @app_commands.describe(role="要停止維護的衍伸身分組")
+    @app_commands.checks.has_permissions(manage_roles=True)
+    async def remove(self, interaction: Interaction, role: discord.Role):
+        log(interaction, role=role.name)
+        if not rs.delete_derived(role.id):
+            await interaction.response.send_message(
+                embed=ui.info_embed(f"{role.mention} 不是衍伸身分組", discord.Color.orange()),
+                ephemeral=True,
+            )
+            return
+        self.invalidate(interaction.guild_id)
+        await interaction.response.send_message(
+            embed=ui.info_embed(f"✅ {role.mention} 已不再自動維護，現有成員保持不變"),
+            ephemeral=True,
+        )
+
+    @roleset.command(name="list", description="列出這個伺服器的衍伸身分組")
+    @app_commands.checks.has_permissions(manage_roles=True)
+    async def list_derived(self, interaction: Interaction):
+        log(interaction)
+        guild = interaction.guild
+        rows = rs.guild_derived(guild.id)
+        if not rows:
+            await interaction.response.send_message(
+                embed=ui.info_embed("這個伺服器還沒有衍伸身分組"), ephemeral=True
+            )
+            return
+
+        embed = discord.Embed(
+            title="🧮 衍伸身分組",
+            description=f"共 {len(rows)} 個，每 {settings.ROLESET_SYNC_INTERVAL} 分鐘完整校正一次",
+            color=discord.Color.blurple(),
+        )
+        for row in rows[:25]:
+            role = guild.get_role(row.role_id)
+            count = f"{len(role.members)} 人" if role else "身分組已不存在"
+            state = "✅" if row.enabled else "⚠️ 已停用（引用的身分組被刪除，請用 derive 重新設定）"
+            embed.add_field(
+                name=trim(f"{role.name if role else row.role_id}・{count}", 256),
+                value=trim(f"<@&{row.role_id}> = {row.expression}\n{state}", FIELD_LIMIT),
+                inline=False,
+            )
+        if len(rows) > 25:
+            embed.set_footer(text=f"還有 {len(rows) - 25} 個沒顯示")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @roleset.command(name="sync", description="立刻把所有衍伸身分組完整校正一次")
+    @app_commands.checks.has_permissions(manage_roles=True)
+    async def sync(self, interaction: Interaction):
+        log(interaction)
+        await interaction.response.defer(ephemeral=True)
+        if not self.rules(interaction.guild_id):
+            await self.error(interaction, "這個伺服器沒有啟用中的衍伸身分組")
+            return
+        await self.report_sync(interaction, interaction.guild, "✅ 校正完成")
+
+    # ------------------------------------------------------------ 集合查詢與提及
+
+    @roleset.command(name="preview", description="看看一個運算式包含哪些成員（不會 @ 任何人）")
+    @app_commands.describe(expression="集合運算式，例如 @高二 & @資訊組")
+    async def preview(self, interaction: Interaction, expression: str):
+        log(interaction, expression=expression)
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        try:
+            node = rs.parse(expression, guild)
+        except rs.ExprError as e:
+            await self.error(interaction, f"運算式有誤：{e}")
+            return
+
+        if not guild.chunked:
+            await guild.chunk()
+        members = rs.evaluate(node, guild)
+        embed = discord.Embed(
+            title=f"🔍 共 {len(members)} 人",
+            description=trim(node.canonical(), 4096),
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(name="成員", value=member_list(members), inline=False)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @roleset.command(name="mention", description="在這個頻道 @ 運算式算出來的所有成員")
+    @app_commands.describe(
+        expression="集合運算式，例如 (@幹部 | @顧問) - @畢業生",
+        message="要一起附上的訊息（選填）",
+    )
+    @app_commands.checks.has_permissions(mention_everyone=True)
+    async def mention(
+        self,
+        interaction: Interaction,
+        expression: str,
+        message: app_commands.Range[str, 1, 1500] | None = None,
+    ):
+        log(interaction, expression=expression)
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        try:
+            node = rs.parse(expression, guild)
+        except rs.ExprError as e:
+            await self.error(interaction, f"運算式有誤：{e}")
+            return
+
+        if not guild.chunked:
+            await guild.chunk()
+        members = rs.evaluate(node, guild)
+        if not members:
+            await self.error(interaction, "這個運算式沒有包含任何人，沒有送出訊息")
+            return
+        if len(members) > settings.ROLESET_MENTION_MAX:
+            await self.error(
+                interaction,
+                f"這個運算式包含 {len(members)} 人，超過上限 {settings.ROLESET_MENTION_MAX} 人",
+            )
+            return
+
+        async def send(button_interaction: Interaction):
+            await self.send_mentions(button_interaction, node, members, message)
+
+        if len(members) <= settings.ROLESET_MENTION_CONFIRM:
+            await send(interaction)
+            return
+
+        embed = discord.Embed(
+            title=f"📢 確定要提及 {len(members)} 人嗎？",
+            description=trim(node.canonical(), 4096),
+            color=discord.Color.orange(),
+        )
+        embed.add_field(name="成員", value=member_list(members), inline=False)
+        await interaction.followup.send(
+            embed=embed, view=ConfirmView(interaction.user.id, send, "送出"), ephemeral=True
+        )
+
+    async def send_mentions(
+        self,
+        interaction: Interaction,
+        node: rs.Node,
+        members: list[discord.Member],
+        message: str | None,
+    ):
+        header = f"📢 **{discord.utils.escape_markdown(interaction.user.display_name)}** 提及了 {node.canonical()}（{len(members)} 人）"
+        if message:
+            header += f"\n{message}"
+        chunks = rs.chunk_mentions(header, [m.id for m in members])
+
+        # 只放行逐一列出的使用者提及；運算式裡的身分組提及只是顯示用，不能真的 ping 到整個身分組
+        allowed = discord.AllowedMentions(everyone=False, roles=False, users=True)
+        try:
+            for chunk in chunks:
+                await interaction.channel.send(chunk, allowed_mentions=allowed)
+        except discord.Forbidden:
+            await self.error(interaction, "我在這個頻道沒有發送訊息的權限")
+            return
+        except discord.HTTPException as e:
+            await self.error(interaction, f"訊息送出失敗：{e}")
+            return
+
+        await interaction.followup.send(
+            embed=ui.info_embed(f"✅ 已提及 {len(members)} 人（{len(chunks)} 則訊息）"),
+            ephemeral=True,
+        )
+
+    # 自動補全綁定（放在指令都定義完之後）
+    derive.autocomplete("expression")(expression_autocomplete)
+    create.autocomplete("expression")(expression_autocomplete)
+    preview.autocomplete("expression")(expression_autocomplete)
+    mention.autocomplete("expression")(expression_autocomplete)
+
+    # ------------------------------------------------------------ 錯誤處理
+
+    async def cog_app_command_error(
+        self, interaction: Interaction, error: app_commands.AppCommandError
+    ):
+        if isinstance(error, app_commands.MissingPermissions):
+            names = {
+                "manage_roles": "管理身分組",
+                "mention_everyone": "提及 @everyone、@here 和所有身分組",
+            }
+            missing = "、".join(names.get(p, p) for p in error.missing_permissions)
+            message = f"你需要「{missing}」權限才能使用這個指令"
+        else:
+            logging.error(f"身分組集合指令發生錯誤: {error}", exc_info=error)
+            message = f"發生未預期的錯誤：{error}"
+
+        embed = ui.info_embed(message, discord.Color.red())
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(RoleSetCog(bot))
+    logging.info(f'{__name__} 已載入')
