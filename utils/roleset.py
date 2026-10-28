@@ -1,8 +1,8 @@
 """身分組集合：運算式解析、求值，以及衍伸身分組的資料表
 
 運算式把身分組當成「成員的集合」來運算，例如 `(@幹部 | @顧問) - @畢業生`。
-全集是伺服器裡所有「非機器人」成員，補集也以此為準 ——
-否則 `~@已驗證` 會連機器人一起算進去，衍伸身分組就會被發給機器人。
+全集是伺服器裡所有成員（包含機器人），補集也以此為準；
+`bot` 與 `human` 分別代表機器人與真人，要排除機器人就寫 `~@已驗證 - bot`。
 
 資料庫裡存的是以 ID 表示的標準形式（`<@&123> | <@&456>`），
 身分組改名不會讓運算式失效；同一個字串直接丟進嵌入就會顯示成身分組提及。
@@ -33,6 +33,15 @@ OPERATORS = {
 STOP_CHARS = set(OPERATORS) | {'"', "「", "」", "<", ">"}
 QUOTES = {'"': '"', "「": "」"}
 ROLE_MENTION = re.compile(r"<@&(\d+)>")
+# 不是身分組、但可以當成集合用的關鍵字（不分大小寫，加引號就會當成身分組名稱）
+KEYWORDS = {
+    "*": ("everyone", "@everyone", "全體"),
+    "bot": ("bot", "bots", "@bot", "機器人"),
+    "human": ("human", "humans", "@human", "真人"),
+}
+KEYWORD_OF = {alias: key for key, aliases in KEYWORDS.items() for alias in aliases}
+# 機器人成員的身分組集合裡會多放這個假 ID，bot / human 就能跟身分組一樣判斷
+BOT_MARKER = -1
 # Discord Markdown 會吃掉的字元：* 清單／斜體、- 清單、~ 刪除線、| 劇透、_ 底線、\ 跳脫本身
 MD_SPECIAL = re.compile(r"([\\*\-~|_])")
 
@@ -46,6 +55,7 @@ class Token:
     kind: str  # 運算子本身、"role"（value 是 ID）或 "name"（value 是名稱）
     value: str | int | None
     pos: int  # 從 1 開始算，給錯誤訊息用
+    quoted: bool = False  # 加了引號的名稱不當關鍵字
 
 
 def tokenize(text: str) -> list[Token]:
@@ -75,7 +85,7 @@ def tokenize(text: str) -> list[Token]:
             name = text[i + 1 : end]
             if not name:
                 raise ExprError(f"第 {i + 1} 個字是空的名稱")
-            tokens.append(Token("name", name, i + 1))
+            tokens.append(Token("name", name, i + 1, quoted=True))
             i = end + 1
             continue
 
@@ -140,6 +150,30 @@ class All(Node):
 
     def canonical(self):
         return "*"
+
+
+@dataclass(frozen=True)
+class Bots(Node):
+    def matches(self, role_ids):
+        return BOT_MARKER in role_ids
+
+    def roles(self):
+        return set()
+
+    def canonical(self):
+        return "bot"
+
+
+@dataclass(frozen=True)
+class Humans(Node):
+    def matches(self, role_ids):
+        return BOT_MARKER not in role_ids
+
+    def roles(self):
+        return set()
+
+    def canonical(self):
+        return "human"
 
 
 @dataclass(frozen=True)
@@ -296,8 +330,9 @@ class Parser:
 
     def role_by_name(self, token: Token) -> Node:
         name: str = token.value
-        if name.lower() in ("@everyone", "everyone"):
-            return All()
+        keyword = None if token.quoted else KEYWORD_OF.get(name.lower())
+        if keyword is not None:
+            return {"*": All, "bot": Bots, "human": Humans}[keyword]()
         if self.guild is None:
             raise ExprError(f"第 {token.pos} 個字：沒有伺服器資訊，只能用 ID")
 
@@ -344,7 +379,7 @@ def display(expression: str) -> str:
 
 def name_token(name: str) -> str:
     """把身分組名稱寫成運算式裡能用的樣子，必要時加引號"""
-    if name and not name.isdigit() and all(
+    if name and not name.isdigit() and name.lower() not in KEYWORD_OF and all(
         not c.isspace() and c not in STOP_CHARS for c in name
     ):
         return name
@@ -356,11 +391,17 @@ def name_token(name: str) -> str:
 # ---------------------------------------------------------------- 求值
 
 
+def member_roles(member) -> set[int]:
+    """成員的身分組 ID，機器人會多一個 BOT_MARKER"""
+    role_ids = {r.id for r in member.roles}
+    if member.bot:
+        role_ids.add(BOT_MARKER)
+    return role_ids
+
+
 def evaluate(node: Node, guild) -> list:
-    """運算結果的成員清單（不含機器人）"""
-    return [
-        m for m in guild.members if not m.bot and node.matches({r.id for r in m.roles})
-    ]
+    """運算結果的成員清單"""
+    return [m for m in guild.members if node.matches(member_roles(m))]
 
 
 Rule = tuple[int, Node]  # (衍伸身分組 ID, 運算式)

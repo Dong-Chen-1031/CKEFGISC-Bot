@@ -142,10 +142,10 @@ class RoleSetCog(commands.Cog):
 
         呼叫端要先拿到伺服器的鎖。權限不足等錯誤會往上丟。
         """
-        if member.bot or not rules:
+        if not rules:
             return False
 
-        current = {r.id for r in member.roles}
+        current = rs.member_roles(member)
         target = rs.apply_rules(current, rules)
         guild = member.guild
         to_add = [r for i in target - current if (r := guild.get_role(i))]
@@ -208,7 +208,7 @@ class RoleSetCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
-        if before.roles == after.roles or after.bot:
+        if before.roles == after.roles:
             return
         changed = {r.id for r in before.roles} ^ {r.id for r in after.roles}
         if changed & self.watched_roles(after.guild.id):
@@ -217,7 +217,7 @@ class RoleSetCog(commands.Cog):
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
         # 補集（例如 ~@已驗證）會包含剛加入的人
-        if not member.bot and self.rules(member.guild.id):
+        if self.rules(member.guild.id):
             await self.sync_member(member.guild, member.id)
 
     @commands.Cog.listener()
@@ -276,9 +276,7 @@ class RoleSetCog(commands.Cog):
 
         diff: dict[int, list[int]] = defaultdict(lambda: [0, 0])
         for member in guild.members:
-            if member.bot:
-                continue
-            current = {r.id for r in member.roles}
+            current = rs.member_roles(member)
             target = rs.apply_rules(current, rules)
             for rid in target - current:
                 diff[rid][0] += 1
@@ -491,7 +489,9 @@ class RoleSetCog(commands.Cog):
                 "`A - B`　`A ∖ B` — 差集：有 A 但沒有 B\n"
                 "`A ^ B`　`A △ B` — 對稱差：A、B 只有其中一個\n"
                 "`~A`　`!A`　`¬A` — 補集：沒有 A 的人\n"
-                "`*`　`@everyone` — 全集：所有人\n"
+                "`*`　`@everyone` — 全集：所有成員（包含機器人）\n"
+                "`bot`　`機器人` — 所有機器人\n"
+                "`human`　`真人` — 所有真人\n"
                 "`( … )` — 括號，先算裡面"
             ),
             inline=False,
@@ -514,7 +514,8 @@ class RoleSetCog(commands.Cog):
         embed.add_field(
             name="範例",
             value=(
-                "`~@已驗證` — 還沒驗證的成員\n"
+                "`~@已驗證 - bot` — 還沒驗證的真人\n"
+                "`bot & @音樂` — 有音樂身分組的機器人\n"
                 "`@高二 & @資訊組` — 高二的資訊組成員\n"
                 "`@高一 - @已繳費` — 還沒繳費的高一\n"
                 "`(@幹部 | @顧問) - @畢業生` — 現任幹部與顧問"
@@ -534,7 +535,7 @@ class RoleSetCog(commands.Cog):
         )
         embed.set_footer(
             text=(
-                "全集只算真人，不含機器人。衍伸身分組的成員完全由運算式決定，手動增減會被改回來；"
+                "全集包含機器人，要排除就加上 - bot。名稱剛好叫 bot、human 的身分組請加引號。衍伸身分組的成員完全由運算式決定，手動增減會被改回來；"
                 f"每 {settings.ROLESET_SYNC_INTERVAL} 分鐘完整校正一次"
             )
         )

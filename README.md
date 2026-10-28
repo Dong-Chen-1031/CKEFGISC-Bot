@@ -593,7 +593,9 @@ INFO  遷移完成：倒數 1 筆、群發 12 筆。舊的 JSON 檔已保留，�
 | 差集 | `A - B`、`A ∖ B`、`A \ B` | 有 A 但沒有 B |
 | 對稱差 | `A ^ B`、`A △ B` | A、B 剛好只有其中一個 |
 | 補集 | `~A`、`!A`、`¬A` | 沒有 A 的人 |
-| 全集 | `*`、`@everyone` | 所有人 |
+| 全集 | `*`、`@everyone`、`全體` | 所有成員（包含機器人） |
+| 機器人 | `bot`、`機器人` | 所有機器人 |
+| 真人 | `human`、`真人` | 所有不是機器人的成員 |
 
 優先序：補集 ＞ 交集 ＞ 聯集／差集／對稱差（同級由左到右算），不確定就加括號。
 
@@ -608,13 +610,17 @@ INFO  遷移完成：倒數 1 筆、群發 12 筆。舊的 JSON 檔已保留，�
 
 `expression` 參數有自動補全，打到一半會列出符合的身分組，選了會接在已經打好的運算式後面。
 
-> **全集只算真人，不含機器人。** 所以 `~@已驗證` 是「還沒驗證的成員」，不會把身分組發給機器人；
-> `/roleset mention` 也不會 @ 到機器人。
+> **全集包含機器人。** `~@已驗證` 會連機器人一起算進去，衍伸身分組也會發給機器人；
+> 只想要真人就寫 `~@已驗證 - bot`（或 `human - @已驗證`）。`/roleset mention` 同理。
+>
+> `bot`、`human` 這些是關鍵字，不分大小寫。如果伺服器裡剛好有身分組叫 `bot`，
+> 要用 `"bot"` 加引號或直接 @ 它。
 
 ### 範例
 
 ```
-/roleset create name:待驗證 expression:~@已驗證
+/roleset create name:待驗證 expression:~@已驗證 - bot
+/roleset create name:音樂機器人 expression:bot & @音樂
 /roleset derive role:@現任幹部 expression:(@幹部 | @顧問) - @畢業生
 /roleset preview expression:@高二 & @資訊組
 /roleset mention expression:@高一 - @已繳費 message:記得在週五前繳社費！
