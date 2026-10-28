@@ -25,6 +25,8 @@ SYNC_REASON = "衍伸身分組自動同步"
 # 預覽與清單裡最多列出幾位成員
 PREVIEW_MEMBERS = 40
 FIELD_LIMIT = 1024
+# 運算式寫錯時附在錯誤訊息後面
+HELP_HINT = "語法可以用 /roleset help 查看"
 
 
 def trim(text: str, limit: int) -> str:
@@ -304,7 +306,7 @@ class RoleSetCog(commands.Cog):
         try:
             node = rs.parse(expression, guild)
         except rs.ExprError as e:
-            await self.error(interaction, f"運算式有誤：{e}")
+            await self.error(interaction, f"運算式有誤：{e}\n{HELP_HINT}")
             return
         cycle = rs.find_cycle(role.id, node, rs.dependency_graph(guild.id, exclude=role.id))
         if cycle:
@@ -379,7 +381,7 @@ class RoleSetCog(commands.Cog):
         try:
             node = rs.parse(expression, guild)
         except rs.ExprError as e:
-            await self.error(interaction, f"運算式有誤：{e}")
+            await self.error(interaction, f"運算式有誤：{e}\n{HELP_HINT}")
             return
 
         try:
@@ -468,6 +470,76 @@ class RoleSetCog(commands.Cog):
             return
         await self.report_sync(interaction, interaction.guild, "✅ 校正完成")
 
+    # ------------------------------------------------------------ 說明
+
+    @roleset.command(name="help", description="查看集合運算式的語法與指令說明")
+    async def help_command(self, interaction: Interaction):
+        log(interaction)
+        embed = discord.Embed(
+            title="🧮 身分組集合說明",
+            description=(
+                "把身分組當成「成員的集合」來運算，例如：\n"
+                "`(@幹部 | @顧問) - @畢業生` → 幹部或顧問，但不含畢業生"
+            ),
+            color=discord.Color.blue(),
+        )
+        embed.add_field(
+            name="運算子",
+            value=(
+                "`A | B`　`A + B`　`A ∪ B` — 聯集：有 A 或有 B\n"
+                "`A & B`　`A ∩ B` — 交集：同時有 A 和 B\n"
+                "`A - B`　`A ∖ B` — 差集：有 A 但沒有 B\n"
+                "`A ^ B`　`A △ B` — 對稱差：A、B 只有其中一個\n"
+                "`~A`　`!A`　`¬A` — 補集：沒有 A 的人\n"
+                "`*`　`@everyone` — 全集：所有人\n"
+                "`( … )` — 括號，先算裡面"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="優先序",
+            value="補集 ＞ 交集 ＞ 聯集／差集／對稱差（同級由左到右算），不確定就加括號",
+            inline=False,
+        )
+        embed.add_field(
+            name="身分組的寫法",
+            value=(
+                "・直接 @ 身分組\n"
+                "・名稱：`幹部` 或 `@幹部`\n"
+                "・名稱有空白或符號時加引號：`\"高三 甲\"`、`「a-b」`\n"
+                "・身分組 ID：`123456789`"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="範例",
+            value=(
+                "`~@已驗證` — 還沒驗證的成員\n"
+                "`@高二 & @資訊組` — 高二的資訊組成員\n"
+                "`@高一 - @已繳費` — 還沒繳費的高一\n"
+                "`(@幹部 | @顧問) - @畢業生` — 現任幹部與顧問"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="指令",
+            value=(
+                "`/roleset preview` — 看運算式包含哪些人（所有人可用）\n"
+                "`/roleset mention` — @ 運算結果的所有人（需「提及所有人」權限）\n"
+                "`/roleset derive`／`create` — 設定／建立衍伸身分組\n"
+                "`/roleset list`／`sync`／`remove` — 查看／校正／停止衍伸身分組\n"
+                "*衍伸身分組相關指令需要「管理身分組」權限*"
+            ),
+            inline=False,
+        )
+        embed.set_footer(
+            text=(
+                "全集只算真人，不含機器人。衍伸身分組的成員完全由運算式決定，手動增減會被改回來；"
+                f"每 {settings.ROLESET_SYNC_INTERVAL} 分鐘完整校正一次"
+            )
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
     # ------------------------------------------------------------ 集合查詢與提及
 
     @roleset.command(name="preview", description="看看一個運算式包含哪些成員（不會 @ 任何人）")
@@ -479,7 +551,7 @@ class RoleSetCog(commands.Cog):
         try:
             node = rs.parse(expression, guild)
         except rs.ExprError as e:
-            await self.error(interaction, f"運算式有誤：{e}")
+            await self.error(interaction, f"運算式有誤：{e}\n{HELP_HINT}")
             return
 
         if not guild.chunked:
@@ -511,7 +583,7 @@ class RoleSetCog(commands.Cog):
         try:
             node = rs.parse(expression, guild)
         except rs.ExprError as e:
-            await self.error(interaction, f"運算式有誤：{e}")
+            await self.error(interaction, f"運算式有誤：{e}\n{HELP_HINT}")
             return
 
         if not guild.chunked:

@@ -581,6 +581,7 @@ INFO  遷移完成：倒數 1 筆、群發 12 筆。舊的 JSON 檔已保留，�
 | `/roleset list` | 列出這個伺服器的衍伸身分組 | 管理身分組 |
 | `/roleset sync` | 立刻完整校正一次 | 管理身分組 |
 | `/roleset preview` | 看看運算式包含哪些人，不會 @ 任何人 | 不限 |
+| `/roleset help` | 查看運算式語法、範例與指令說明 | 不限 |
 | `/roleset mention` | 在目前頻道 @ 運算結果的所有人 | 提及 @everyone、@here 和所有身分組 |
 
 ### 運算式語法
