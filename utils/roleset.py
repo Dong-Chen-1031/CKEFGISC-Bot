@@ -1,6 +1,7 @@
 """身分組集合：運算式解析、求值，以及衍伸身分組的資料表
 
-運算式把身分組當成「成員的集合」來運算，例如 `(@幹部 | @顧問) - @畢業生`。
+運算式把身分組當成「成員的集合」來運算，例如 `(@幹部 | @顧問) - @畢業生`；
+也可以直接寫個人，當成只有一個人的集合，例如 `@幹部 | @小明`。
 全集是伺服器裡所有成員（包含機器人），補集也以此為準；
 `bot` 與 `human` 分別代表機器人與真人，要排除機器人就寫 `~@已驗證 - bot`。
 
@@ -33,6 +34,7 @@ OPERATORS = {
 STOP_CHARS = set(OPERATORS) | {'"', "「", "」", "<", ">"}
 QUOTES = {'"': '"', "「": "」"}
 ROLE_MENTION = re.compile(r"<@&(\d+)>")
+USER_MENTION = re.compile(r"<@!?(\d+)>")
 # 不是身分組、但可以當成集合用的關鍵字（不分大小寫，加引號就會當成身分組名稱）
 KEYWORDS = {
     "*": ("everyone", "@everyone", "全體"),
@@ -52,7 +54,7 @@ class ExprError(ValueError):
 
 @dataclass(frozen=True)
 class Token:
-    kind: str  # 運算子本身、"role"（value 是 ID）或 "name"（value 是名稱）
+    kind: str  # 運算子本身、"role"（ID，可能是身分組或成員）、"user"（成員 ID）或 "name"（名稱）
     value: str | int | None
     pos: int  # 從 1 開始算，給錯誤訊息用
     quoted: bool = False  # 加了引號的名稱不當關鍵字
@@ -70,6 +72,12 @@ def tokenize(text: str) -> list[Token]:
         mention = ROLE_MENTION.match(text, i)
         if mention:
             tokens.append(Token("role", int(mention.group(1)), i + 1))
+            i = mention.end()
+            continue
+
+        mention = USER_MENTION.match(text, i)
+        if mention:
+            tokens.append(Token("user", int(mention.group(1)), i + 1))
             i = mention.end()
             continue
 
@@ -174,6 +182,26 @@ class Humans(Node):
 
     def canonical(self):
         return "human"
+
+
+@dataclass(frozen=True)
+class UserRef(Node):
+    """單一成員，當成只有一個人的集合
+
+    成員 ID 跟身分組 ID 都是 Discord 的 snowflake，不會撞號，
+    所以直接放進同一個集合裡判斷（見 member_roles）。
+    """
+
+    user_id: int
+
+    def matches(self, role_ids):
+        return self.user_id in role_ids
+
+    def roles(self):
+        return set()
+
+    def canonical(self):
+        return f"<@{self.user_id}>"
 
 
 @dataclass(frozen=True)
@@ -312,6 +340,8 @@ class Parser:
             return All()
         if token.kind == "role":
             return self.role_by_id(token)
+        if token.kind == "user":
+            return self.user_by_id(token)
         if token.kind == "name":
             return self.role_by_name(token)
         raise ExprError(f"第 {token.pos} 個字的 `{token.kind}` 前面少了一個身分組")
@@ -325,8 +355,15 @@ class Parser:
             return All()
         if self.guild.get_role(role_id) is not None:
             return RoleRef(role_id)
+        if self.guild.get_member(role_id) is not None:
+            return UserRef(role_id)
         # 純數字也可能是名稱
         return self.role_by_name(Token("name", str(role_id), token.pos))
+
+    def user_by_id(self, token: Token) -> Node:
+        if self.guild is not None and self.guild.get_member(token.value) is None:
+            raise ExprError(f"第 {token.pos} 個字：<@{token.value}> 不在這個伺服器裡")
+        return UserRef(token.value)
 
     def role_by_name(self, token: Token) -> Node:
         name: str = token.value
@@ -349,7 +386,20 @@ class Parser:
                 return RoleRef(found[0].id)
             if len(found) > 1:
                 raise ExprError(f"有 {len(found)} 個身分組都叫「{wanted}」，請改用提及或 ID")
-        raise ExprError(f"第 {token.pos} 個字：找不到叫「{name}」的身分組")
+
+        # 沒有這個名稱的身分組，再找成員（帳號名稱、顯示名稱、伺服器暱稱都算）
+        for wanted in candidates:
+            lowered = wanted.lower()
+            found = [
+                m
+                for m in self.guild.members
+                if lowered in {(n or "").lower() for n in (m.name, m.global_name, m.nick)}
+            ]
+            if len(found) == 1:
+                return UserRef(found[0].id)
+            if len(found) > 1:
+                raise ExprError(f"有 {len(found)} 位成員都叫「{wanted}」，請改用提及或 ID")
+        raise ExprError(f"第 {token.pos} 個字：找不到叫「{name}」的身分組或成員")
 
 
 def parse(text: str, guild=None) -> Node:
@@ -392,8 +442,9 @@ def name_token(name: str) -> str:
 
 
 def member_roles(member) -> set[int]:
-    """成員的身分組 ID，機器人會多一個 BOT_MARKER"""
+    """成員的身分組 ID 加上自己的 ID（給 UserRef 判斷），機器人再多一個 BOT_MARKER"""
     role_ids = {r.id for r in member.roles}
+    role_ids.add(member.id)
     if member.bot:
         role_ids.add(BOT_MARKER)
     return role_ids
@@ -463,22 +514,30 @@ def find_cycle(role_id: int, node: Node, graph: dict[int, set[int]]) -> list[int
     return path if visit(role_id) else None
 
 
-def chunk_mentions(header: str, user_ids: list[int], limit: int = 2000) -> list[str]:
-    """把一串使用者提及切成不超過 limit 字的訊息，第一則帶 header"""
+def chunk_mentions(
+    header: str, user_ids: list[int], limit: int = 2000
+) -> list[tuple[str, list[int]]]:
+    """把一串使用者提及切成不超過 limit 字的訊息，第一則帶 header
+
+    回傳 (訊息, 這則裡列出的使用者)。送出時只放行這些人的提及 ——
+    header 裡的運算式可能寫了 `@高三 - @小華`，不能反而 ping 到被排除的小華。
+    一則 2000 字最多塞得下約 95 個提及，不會超過 Discord 每則 100 人的白名單上限。
+    """
     if len(header) > limit:
         header = header[: limit - 1] + "…"
-    messages: list[str] = []
-    current = header
+    messages: list[tuple[str, list[int]]] = []
+    current, ids = header, []
     for uid in user_ids:
         mention = f"<@{uid}>"
         sep = "\n" if current == header and header else " "
         if current and len(current) + len(sep) + len(mention) > limit:
-            messages.append(current)
-            current = mention
+            messages.append((current, ids))
+            current, ids = mention, [uid]
         else:
             current = f"{current}{sep}{mention}" if current else mention
+            ids.append(uid)
     if current:
-        messages.append(current)
+        messages.append((current, ids))
     return messages
 
 

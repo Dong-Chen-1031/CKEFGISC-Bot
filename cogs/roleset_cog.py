@@ -245,7 +245,7 @@ class RoleSetCog(commands.Cog):
     async def expression_autocomplete(
         self, interaction: Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
-        """補全最後一個還沒打完的身分組名稱，前面已經打好的部分原樣保留"""
+        """補全最後一個還沒打完的身分組或成員名稱，前面已經打好的部分原樣保留"""
         guild = interaction.guild
         if guild is None:
             return []
@@ -261,6 +261,26 @@ class RoleSetCog(commands.Cog):
                 continue
             value = prefix + rs.name_token(role.name)
             if len(value) > 100:  # 選項值的上限，太長就只能自己打了
+                continue
+            choices.append(app_commands.Choice(name=value, value=value))
+            if len(choices) >= 25:
+                return choices
+
+        # 有打字才列成員，不然清單會被一堆不相干的人塞滿
+        if not partial:
+            return choices
+        role_names = {r.name.lower() for r in guild.roles}
+        for member in guild.members:
+            names = [n for n in (member.nick, member.global_name, member.name) if n]
+            if not any(partial in n.lower() for n in names):
+                continue
+            # 名稱跟身分組撞名、或有人同名時，解析會選到別的，改用 ID
+            name = member.display_name
+            clash = name.lower() in role_names or sum(
+                1 for m in guild.members if name.lower() in {(n or "").lower() for n in (m.name, m.global_name, m.nick)}
+            ) > 1
+            value = prefix + (str(member.id) if clash else rs.name_token(name))
+            if len(value) > 100:
                 continue
             choices.append(app_commands.Choice(name=value, value=value))
             if len(choices) >= 25:
@@ -502,12 +522,12 @@ class RoleSetCog(commands.Cog):
             inline=False,
         )
         embed.add_field(
-            name="身分組的寫法",
+            name="身分組與個人的寫法",
             value=(
-                "・直接 @ 身分組\n"
-                "・名稱：`幹部` 或 `@幹部`\n"
+                "・直接 @ 身分組或成員（成員就是只有一個人的集合）\n"
+                "・名稱：`幹部` 或 `@幹部`；找不到身分組才會找同名的成員\n"
                 "・名稱有空白或符號時加引號：`\"高三 甲\"`、`「a-b」`\n"
-                "・身分組 ID：`123456789`"
+                "・身分組或成員的 ID：`123456789`"
             ),
             inline=False,
         )
@@ -516,6 +536,7 @@ class RoleSetCog(commands.Cog):
             value=(
                 "`~@已驗證 - bot` — 還沒驗證的真人\n"
                 "`bot & @音樂` — 有音樂身分組的機器人\n"
+                "`@高三 - @小華` — 高三除了小華以外的人\n"
                 "`@高二 & @資訊組` — 高二的資訊組成員\n"
                 "`@高一 - @已繳費` — 還沒繳費的高一\n"
                 "`(@幹部 | @顧問) - @畢業生` — 現任幹部與顧問"
@@ -629,10 +650,12 @@ class RoleSetCog(commands.Cog):
             header += f"\n{message}"
         chunks = rs.chunk_mentions(header, [m.id for m in members])
 
-        # 只放行逐一列出的使用者提及；運算式裡的身分組提及只是顯示用，不能真的 ping 到整個身分組
-        allowed = discord.AllowedMentions(everyone=False, roles=False, users=True)
+        # 只放行這則逐一列出的使用者；運算式裡的身分組與個人提及只是顯示用，不能真的 ping 到
         try:
-            for chunk in chunks:
+            for chunk, ids in chunks:
+                allowed = discord.AllowedMentions(
+                    everyone=False, roles=False, users=[discord.Object(i) for i in ids]
+                )
                 await interaction.channel.send(chunk, allowed_mentions=allowed)
         except discord.Forbidden:
             await self.error(interaction, "我在這個頻道沒有發送訊息的權限")
