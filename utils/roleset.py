@@ -33,6 +33,8 @@ OPERATORS = {
 STOP_CHARS = set(OPERATORS) | {'"', "「", "」", "<", ">"}
 QUOTES = {'"': '"', "「": "」"}
 ROLE_MENTION = re.compile(r"<@&(\d+)>")
+# Discord Markdown 會吃掉的字元：* 清單／斜體、- 清單、~ 刪除線、| 劇透、_ 底線、\ 跳脫本身
+MD_SPECIAL = re.compile(r"([\\*\-~|_])")
 
 
 class ExprError(ValueError):
@@ -119,6 +121,10 @@ class Node:
         if child.prec < self.prec or (strict and child.prec == self.prec):
             return f"({text})"
         return text
+
+    def display(self) -> str:
+        """給人看的版本，可以安全放進 Discord 訊息"""
+        return display(self.canonical())
 
     def __str__(self) -> str:
         return self.canonical()
@@ -318,6 +324,22 @@ def parse(text: str, guild=None) -> Node:
     不給的話只接受 ID / 提及（讀資料庫裡的標準形式時用）。
     """
     return Parser(text, guild).parse()
+
+
+def display(expression: str) -> str:
+    """把標準形式轉成能安全放進 Discord 訊息的樣子
+
+    `* - <@&1>` 直接送出去會在行首被當成兩層清單、`~~<@&1>` 會變刪除線，
+    所以運算子都加上反斜線；身分組提及保持原樣，才會繼續顯示成身分組。
+    """
+    parts = []
+    last = 0
+    for mention in ROLE_MENTION.finditer(expression):
+        parts.append(MD_SPECIAL.sub(r"\\\1", expression[last : mention.start()]))
+        parts.append(mention.group(0))
+        last = mention.end()
+    parts.append(MD_SPECIAL.sub(r"\\\1", expression[last:]))
+    return "".join(parts)
 
 
 def name_token(name: str) -> str:

@@ -322,11 +322,11 @@ class RoleSetCog(commands.Cog):
         old = rs.get_derived(role.id)
         embed = discord.Embed(
             title="🧮 設定衍伸身分組",
-            description=f"{role.mention} = {node.canonical()}",
+            description=f"{role.mention} = {node.display()}",
             color=discord.Color.blurple(),
         )
         if old is not None:
-            embed.add_field(name="原本的運算式", value=trim(old.expression, FIELD_LIMIT), inline=False)
+            embed.add_field(name="原本的運算式", value=trim(rs.display(old.expression), FIELD_LIMIT), inline=False)
         embed.add_field(name="➕ 會加入", value=f"{added} 人", inline=True)
         embed.add_field(name="➖ 會移除", value=f"{removed} 人", inline=True)
         others = [
@@ -402,7 +402,7 @@ class RoleSetCog(commands.Cog):
             )
         )
         self.invalidate(guild.id)
-        await self.report_sync(interaction, guild, f"✅ 已建立 {role.mention} = {node.canonical()}")
+        await self.report_sync(interaction, guild, f"✅ 已建立 {role.mention} = {node.display()}")
 
     async def report_sync(self, interaction: Interaction, guild: discord.Guild, title: str):
         """立刻校正一次並回報結果"""
@@ -453,7 +453,7 @@ class RoleSetCog(commands.Cog):
             state = "✅" if row.enabled else "⚠️ 已停用（引用的身分組被刪除，請用 derive 重新設定）"
             embed.add_field(
                 name=trim(f"{role.name if role else row.role_id}・{count}", 256),
-                value=trim(f"<@&{row.role_id}> = {row.expression}\n{state}", FIELD_LIMIT),
+                value=trim(f"<@&{row.role_id}> = {rs.display(row.expression)}\n{state}", FIELD_LIMIT),
                 inline=False,
             )
         if len(rows) > 25:
@@ -559,7 +559,7 @@ class RoleSetCog(commands.Cog):
         members = rs.evaluate(node, guild)
         embed = discord.Embed(
             title=f"🔍 共 {len(members)} 人",
-            description=trim(node.canonical(), 4096),
+            description=trim(node.display(), 4096),
             color=discord.Color.blurple(),
         )
         embed.add_field(name="成員", value=member_list(members), inline=False)
@@ -608,7 +608,7 @@ class RoleSetCog(commands.Cog):
 
         embed = discord.Embed(
             title=f"📢 確定要提及 {len(members)} 人嗎？",
-            description=trim(node.canonical(), 4096),
+            description=trim(node.display(), 4096),
             color=discord.Color.orange(),
         )
         embed.add_field(name="成員", value=member_list(members), inline=False)
@@ -623,7 +623,7 @@ class RoleSetCog(commands.Cog):
         members: list[discord.Member],
         message: str | None,
     ):
-        header = f"📢 **{discord.utils.escape_markdown(interaction.user.display_name)}** 提及了 {node.canonical()}（{len(members)} 人）"
+        header = f"📢 **{discord.utils.escape_markdown(interaction.user.display_name)}** 提及了 {node.display()}（{len(members)} 人）"
         if message:
             header += f"\n{message}"
         chunks = rs.chunk_mentions(header, [m.id for m in members])
